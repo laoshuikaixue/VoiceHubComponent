@@ -8,10 +8,23 @@
     <CreateCipx>true</CreateCipx>
     <AssemblyName>VoiceHubComponent</AssemblyName>
     <RootNamespace>VoiceHubComponent</RootNamespace>
+    
+    <!-- 插件发布配置 -->
+    <PublishSingleFile>false</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <PublishTrimmed>false</PublishTrimmed>
+    
+    <!-- 优化包大小 -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="ClassIsland.PluginSdk" Version="1.5.0.2" />
+    <PackageReference Include="ClassIsland.PluginSdk" Version="1.5.0.2">
+      <PrivateAssets>all</PrivateAssets>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
   </ItemGroup>
 
   <Import Project="..\ClassIsland.PluginSdk\ClassIsland.PluginSdk.targets" />
