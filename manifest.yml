@@ -1,0 +1,9 @@
+id: voicehub.broadcast  # 插件 id
+name: VoiceHub广播站排期  # 插件名称
+apiVersion: 1.4.2.0  # 插件面向的 ClassIsland 版本
+description: 展示广播站当日排期歌曲，按播放顺序显示歌曲信息  # 插件描述
+entranceAssembly: "VoiceHubComponent.dll"  # 插件入口程序集
+url: https://github.com/laoshuikaixue/VoiceHubComponent  # 插件 Url
+author: LaoShui  # 插件作者
+version: 1.0.0.0  # 插件版本
+icon: icon.png
