@@ -30,6 +30,12 @@ namespace VoiceHubComponent
         private ComponentState _currentState = ComponentState.Loading;
         private readonly DispatcherTimer _refreshTimer;
         private Storyboard? _loadingAnimation;
+        
+        // 重试逻辑相关字段
+        private int _retryCount = 0;
+        private const int MaxRetryCount = 3;
+        private DateTime _lastFailureTime = DateTime.MinValue;
+        private readonly TimeSpan _retryDelay = TimeSpan.FromMinutes(10);
 
         public VoiceHubControl(VoiceHubSettings settings)
         {
@@ -39,10 +45,10 @@ namespace VoiceHubComponent
             // 设置HTTP客户端超时
             _httpClient.Timeout = TimeSpan.FromSeconds(10);
             
-            // 初始化1小时刷新定时器
+            // 初始化定时器，正常情况下1小时刷新一次，失败后1分钟检查一次
             _refreshTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromHours(1) // 1小时刷新一次
+                Interval = TimeSpan.FromHours(1) // 默认1小时刷新一次
             };
             _refreshTimer.Tick += async (sender, e) => await RefreshAsync();
             _refreshTimer.Start();
@@ -113,111 +119,172 @@ namespace VoiceHubComponent
             }
         }
 
+        private void UpdateTimerInterval()
+        {
+            // 如果有失败记录且还在冷却期内，设置为1分钟检查一次
+            if (_lastFailureTime != DateTime.MinValue && 
+                DateTime.Now - _lastFailureTime < _retryDelay)
+            {
+                _refreshTimer.Interval = TimeSpan.FromMinutes(1);
+            }
+            else
+            {
+                // 恢复正常的1小时间隔
+                _refreshTimer.Interval = TimeSpan.FromHours(1);
+            }
+        }
+
         private async Task LoadVoiceHubDataAsync()
+        {
+            // 更新定时器间隔
+            UpdateTimerInterval();
+            
+            // 检查是否需要等待（上次失败后的冷却时间）
+            if (_lastFailureTime != DateTime.MinValue && 
+                DateTime.Now - _lastFailureTime < _retryDelay)
+            {
+                var remainingTime = _retryDelay - (DateTime.Now - _lastFailureTime);
+                SetState(ComponentState.NetworkError, $"等待重试中... ({remainingTime.Minutes}分{remainingTime.Seconds}秒后重试)");
+                return;
+            }
+
+            // 尝试加载数据，带重试逻辑
+            for (int attempt = 0; attempt <= MaxRetryCount; attempt++)
+            {
+                try
+                {
+                    await LoadVoiceHubDataCoreAsync();
+                    
+                    // 成功加载，重置重试计数和失败时间
+                    _retryCount = 0;
+                    _lastFailureTime = DateTime.MinValue;
+                    
+                    // 成功后恢复正常定时器间隔
+                    UpdateTimerInterval();
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    // 请求被取消，不需要重试
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _retryCount = attempt + 1;
+                    
+                    // 如果还有重试机会
+                    if (attempt < MaxRetryCount)
+                    {
+                        SetState(ComponentState.NetworkError, $"获取失败，正在重试... ({_retryCount}/{MaxRetryCount})");
+                        
+                        // 等待一段时间后重试（递增延迟：2秒、4秒、8秒）
+                        var retryDelay = TimeSpan.FromSeconds(Math.Pow(2, attempt + 1));
+                        await Task.Delay(retryDelay);
+                    }
+                    else
+                    {
+                        // 所有重试都失败了，记录失败时间并设置错误状态
+                        _lastFailureTime = DateTime.Now;
+                        
+                        string errorMessage = ex switch
+                        {
+                            HttpRequestException => "网络连接错误，10分钟后重试",
+                            TaskCanceledException => "请求超时，10分钟后重试", 
+                            JsonException => "数据格式错误，10分钟后重试",
+                            _ => "获取失败，10分钟后重试"
+                        };
+                        
+                        SetState(ComponentState.NetworkError, errorMessage);
+                        
+                        // 失败后调整定时器间隔
+                        UpdateTimerInterval();
+                    }
+                }
+            }
+        }
+
+        private async Task LoadVoiceHubDataCoreAsync()
         {
             // 取消之前的请求
             _cancellationTokenSource?.Cancel();
             _cancellationTokenSource = new CancellationTokenSource();
 
-            try
-            {
-                // 设置加载状态
-                SetState(ComponentState.Loading);
-                
-                // 使用配置的API地址
-                var apiUrl = !string.IsNullOrEmpty(_settings.ApiUrl) 
-                    ? _settings.ApiUrl 
-                    : "https://voicehub.lao-shui.top/api/songs/public";
-                
-                var jsonResponse = await _httpClient.GetStringAsync(apiUrl, _cancellationTokenSource.Token);
-                var songItems = JsonSerializer.Deserialize<List<SongItem>>(jsonResponse);
+            // 设置加载状态
+            SetState(ComponentState.Loading);
+            
+            // 使用配置的API地址
+            var apiUrl = !string.IsNullOrEmpty(_settings.ApiUrl) 
+                ? _settings.ApiUrl 
+                : "https://voicehub.lao-shui.top/api/songs/public";
+            
+            var jsonResponse = await _httpClient.GetStringAsync(apiUrl, _cancellationTokenSource.Token);
+            var songItems = JsonSerializer.Deserialize<List<SongItem>>(jsonResponse);
 
-                if (songItems == null || !songItems.Any())
+            if (songItems == null || !songItems.Any())
+            {
+                SetState(ComponentState.NoSchedule, "暂无排期数据");
+                return;
+            }
+
+            // 过滤掉无效日期的项目
+            var validItems = songItems.Where(s => s.GetPlayDate() != DateTime.MinValue).ToList();
+            
+            if (!validItems.Any())
+            {
+                SetState(ComponentState.NoSchedule, "暂无有效排期数据");
+                return;
+            }
+
+            // 找到今天或最近未来的排期
+            var today = DateTime.Today;
+            var todaySchedule = validItems.Where(s => s.GetPlayDate() == today).OrderBy(s => s.Sequence).ToList();
+            
+            List<SongItem> displayItems;
+            DateTime actualDate;
+            
+            if (todaySchedule.Any())
+            {
+                displayItems = todaySchedule;
+                actualDate = today;
+            }
+            else
+            {
+                // 找最近的未来排期
+                var futureSchedule = validItems
+                    .Where(s => s.GetPlayDate() > today)
+                    .GroupBy(s => s.GetPlayDate())
+                    .OrderBy(g => g.Key)
+                    .FirstOrDefault();
+                
+                if (futureSchedule != null)
+                {
+                    displayItems = futureSchedule.OrderBy(s => s.Sequence).ToList();
+                    actualDate = futureSchedule.Key;
+                }
+                else
                 {
                     SetState(ComponentState.NoSchedule, "暂无排期数据");
                     return;
                 }
+            }
 
-                // 过滤掉无效日期的项目
-                var validItems = songItems.Where(s => s.GetPlayDate() != DateTime.MinValue).ToList();
-                
-                if (!validItems.Any())
-                {
-                    SetState(ComponentState.NoSchedule, "暂无有效排期数据");
-                    return;
-                }
+            // 验证显示项目的日期一致性
+            var inconsistentItems = displayItems.Where(item => item.GetPlayDate() != actualDate).ToList();
+            if (inconsistentItems.Any())
+            {
+                // 记录日期不一致的问题，但继续显示一致的项目
+                displayItems = displayItems.Where(item => item.GetPlayDate() == actualDate).ToList();
+            }
 
-                // 找到今天或最近未来的排期
-                var today = DateTime.Today;
-                var todaySchedule = validItems.Where(s => s.GetPlayDate() == today).OrderBy(s => s.Sequence).ToList();
-                
-                List<SongItem> displayItems;
-                DateTime actualDate;
-                
-                if (todaySchedule.Any())
-                {
-                    displayItems = todaySchedule;
-                    actualDate = today;
-                }
-                else
-                {
-                    // 找最近的未来排期
-                    var futureSchedule = validItems
-                        .Where(s => s.GetPlayDate() > today)
-                        .GroupBy(s => s.GetPlayDate())
-                        .OrderBy(g => g.Key)
-                        .FirstOrDefault();
-                    
-                    if (futureSchedule != null)
-                    {
-                        displayItems = futureSchedule.OrderBy(s => s.Sequence).ToList();
-                        actualDate = futureSchedule.Key;
-                    }
-                    else
-                    {
-                        SetState(ComponentState.NoSchedule, "暂无排期数据");
-                        return;
-                    }
-                }
+            if (!displayItems.Any())
+            {
+                SetState(ComponentState.NoSchedule, "排期数据日期不一致");
+                return;
+            }
 
-                // 验证显示项目的日期一致性
-                var inconsistentItems = displayItems.Where(item => item.GetPlayDate() != actualDate).ToList();
-                if (inconsistentItems.Any())
-                {
-                    // 记录日期不一致的问题，但继续显示一致的项目
-                    displayItems = displayItems.Where(item => item.GetPlayDate() == actualDate).ToList();
-                }
-
-                if (!displayItems.Any())
-                {
-                    SetState(ComponentState.NoSchedule, "排期数据日期不一致");
-                    return;
-                }
-
-                // 格式化显示内容，使用实际的内容日期
-                var displayText = FormatScheduleDisplay(displayItems, actualDate.ToString("yyyy/MM/dd"));
-                SetState(ComponentState.Normal, displayText);
-            }
-            catch (TaskCanceledException)
-            {
-                SetState(ComponentState.NetworkError, "广播站排期获取失败");
-            }
-            catch (OperationCanceledException)
-            {
-                // 请求被取消，不需要处理
-            }
-            catch (HttpRequestException)
-            {
-                SetState(ComponentState.NetworkError, "广播站排期获取失败");
-            }
-            catch (JsonException)
-            {
-                SetState(ComponentState.NetworkError, "广播站排期获取失败");
-            }
-            catch (Exception)
-            {
-                SetState(ComponentState.NetworkError, "广播站排期获取失败");
-            }
+            // 格式化显示内容，使用实际的内容日期
+            var displayText = FormatScheduleDisplay(displayItems, actualDate.ToString("yyyy/MM/dd"));
+            SetState(ComponentState.Normal, displayText);
         }
 
         private void SetState(ComponentState state, string? message = null)
@@ -272,7 +339,7 @@ namespace VoiceHubComponent
             foreach (var item in items) // 显示所有歌曲
             {
                 var song = item.Song;
-                songInfos.Add($"#{item.Sequence:D2} {song.Artist} - {song.Title} - {song.Requester}");
+                songInfos.Add($"#{item.Sequence} {song.Artist} - {song.Title} - {song.Requester}");
             }
 
             sb.Append(string.Join(" | ", songInfos));
