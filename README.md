@@ -2,6 +2,8 @@
 
 这是一个用于展示VoiceHub广播站平台当日排期歌曲的ClassIsland插件。
 
+使用建议：搭配滚动组件，开启宽度限制
+
 ---
 
 Powered By LaoShui @ 2025

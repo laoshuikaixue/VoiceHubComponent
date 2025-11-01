@@ -12,24 +12,14 @@
                     VerticalAlignment="Center"
                     Orientation="Horizontal"
                     Visibility="Visible">
-            <materialDesign:PackIcon Kind="Loading" 
+            <materialDesign:PackIcon x:Name="LoadingIcon"
+                                     Kind="Loading" 
                                      Width="16" 
                                      Height="16"
                                      Margin="0,0,8,0">
                 <materialDesign:PackIcon.RenderTransform>
-                    <RotateTransform x:Name="LoadingRotation"/>
+                    <RotateTransform x:Name="LoadingRotation" CenterX="8" CenterY="8"/>
                 </materialDesign:PackIcon.RenderTransform>
-                <materialDesign:PackIcon.Triggers>
-                    <EventTrigger RoutedEvent="Loaded">
-                        <BeginStoryboard>
-                            <Storyboard RepeatBehavior="Forever">
-                                <DoubleAnimation Storyboard.TargetName="LoadingRotation"
-                                                 Storyboard.TargetProperty="Angle"
-                                                 From="0" To="360" Duration="0:0:1"/>
-                            </Storyboard>
-                        </BeginStoryboard>
-                    </EventTrigger>
-                </materialDesign:PackIcon.Triggers>
             </materialDesign:PackIcon>
             <TextBlock Text="正在加载..." 
                        FontSize="{DynamicResource MainWindowBodyFontSize}"

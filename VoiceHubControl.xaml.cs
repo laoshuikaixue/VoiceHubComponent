@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using ClassIsland.Core.Abstractions.Controls;
 using ClassIsland.Core.Attributes;
@@ -27,6 +28,8 @@ namespace VoiceHubComponent
         private readonly VoiceHubSettings _settings;
         private CancellationTokenSource? _cancellationTokenSource;
         private ComponentState _currentState = ComponentState.Loading;
+        private readonly DispatcherTimer _refreshTimer;
+        private Storyboard? _loadingAnimation;
 
         public VoiceHubControl(VoiceHubSettings settings)
         {
@@ -35,6 +38,14 @@ namespace VoiceHubComponent
             
             // 设置HTTP客户端超时
             _httpClient.Timeout = TimeSpan.FromSeconds(10);
+            
+            // 初始化1小时刷新定时器
+            _refreshTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromHours(1) // 1小时刷新一次
+            };
+            _refreshTimer.Tick += async (sender, e) => await RefreshAsync();
+            _refreshTimer.Start();
             
             // 显示加载状态
             SetState(ComponentState.Loading);
@@ -54,6 +65,52 @@ namespace VoiceHubComponent
                     Dispatcher.Invoke(() => SetState(ComponentState.NetworkError, "广播站排期获取失败"));
                 }
             });
+        }
+
+        /// <summary>
+        /// 启动加载动画
+        /// </summary>
+        private void StartLoadingAnimation()
+        {
+            if (_loadingAnimation != null)
+            {
+                _loadingAnimation.Stop();
+            }
+
+            // 创建旋转动画
+            var rotateAnimation = new DoubleAnimation
+            {
+                From = 0,
+                To = 360,
+                Duration = TimeSpan.FromMilliseconds(800), // 稍微快一点，800ms一圈
+                RepeatBehavior = RepeatBehavior.Forever
+                // 移除EasingFunction，使用默认的线性动画
+            };
+
+            _loadingAnimation = new Storyboard();
+            _loadingAnimation.Children.Add(rotateAnimation);
+            
+            // 设置动画目标
+            Storyboard.SetTarget(rotateAnimation, LoadingRotation);
+            Storyboard.SetTargetProperty(rotateAnimation, new PropertyPath("Angle"));
+
+            // 启动动画
+            _loadingAnimation.Begin();
+        }
+
+        /// <summary>
+        /// 停止加载动画
+        /// </summary>
+        private void StopLoadingAnimation()
+        {
+            _loadingAnimation?.Stop();
+            _loadingAnimation = null;
+            
+            // 重置旋转角度
+            if (LoadingRotation != null)
+            {
+                LoadingRotation.Angle = 0;
+            }
         }
 
         private async Task LoadVoiceHubDataAsync()
@@ -183,19 +240,23 @@ namespace VoiceHubComponent
             {
                 case ComponentState.Loading:
                     LoadingPanel.Visibility = Visibility.Visible;
+                    StartLoadingAnimation(); // 启动加载动画
                     break;
                     
                 case ComponentState.Normal:
+                    StopLoadingAnimation(); // 停止加载动画
                     VoiceHubText.Text = message ?? "";
                     VoiceHubText.Visibility = Visibility.Visible;
                     break;
                     
                 case ComponentState.NetworkError:
+                    StopLoadingAnimation(); // 停止加载动画
                     ErrorText.Text = message ?? "网络错误";
                     ErrorPanel.Visibility = Visibility.Visible;
                     break;
                     
                 case ComponentState.NoSchedule:
+                    StopLoadingAnimation(); // 停止加载动画
                     ErrorText.Text = message ?? "暂无排期";
                     ErrorPanel.Visibility = Visibility.Visible;
                     break;
@@ -232,6 +293,9 @@ namespace VoiceHubComponent
         /// </summary>
         public void Dispose()
         {
+            // 停止并清理定时器
+            _refreshTimer?.Stop();
+            
             // 取消正在进行的请求
             _cancellationTokenSource?.Cancel();
             _httpClient?.Dispose();
