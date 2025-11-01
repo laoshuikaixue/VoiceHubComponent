@@ -1,0 +1,77 @@
+<ci:ComponentBase x:Class="VoiceHubComponent.Views.VoiceHubSettingsView"
+                x:TypeArguments="models:VoiceHubSettings"
+                xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" 
+                xmlns:d="http://schemas.microsoft.com/expression/blend/2008" 
+                xmlns:materialDesign="http://materialdesigninxaml.net/winfx/xaml/themes"
+                xmlns:ci="http://classisland.tech/schemas/xaml/core"
+                xmlns:models="clr-namespace:VoiceHubComponent.Models"
+                mc:Ignorable="d" 
+                d:DesignHeight="450" d:DesignWidth="800">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- 标题 -->
+        <TextBlock Grid.Row="0" 
+                   Text="VoiceHub 插件设置" 
+                   Style="{StaticResource MaterialDesignHeadline5TextBlock}"
+                   Margin="0,0,0,16"/>
+
+        <!-- API地址设置 -->
+        <StackPanel Grid.Row="1" Margin="0,0,0,16">
+            <TextBlock Text="API 地址" 
+                       Style="{StaticResource MaterialDesignSubtitle1TextBlock}"
+                       Margin="0,0,0,8"/>
+            
+            <TextBox x:Name="ApiUrlTextBox"
+                     Text="{Binding ApiUrl, UpdateSourceTrigger=PropertyChanged}"
+                     materialDesign:HintAssist.Hint="请输入 VoiceHub API 地址"
+                     Style="{StaticResource MaterialDesignOutlinedTextBox}"
+                     MinWidth="400"
+                     HorizontalAlignment="Left"/>
+            
+            <TextBlock Text="默认: https://voicehub.lao-shui.top/api/songs/public"
+                       Style="{StaticResource MaterialDesignCaptionTextBlock}"
+                       Foreground="{DynamicResource MaterialDesignBodyLight}"
+                       Margin="0,4,0,0"/>
+        </StackPanel>
+
+        <!-- 操作按钮 -->
+        <StackPanel Grid.Row="2" 
+                    Orientation="Horizontal" 
+                    HorizontalAlignment="Left"
+                    Margin="0,0,0,16">
+            
+            <Button x:Name="TestConnectionButton"
+                    Content="测试连接"
+                    Style="{StaticResource MaterialDesignOutlinedButton}"
+                    Click="TestConnectionButton_Click"
+                    Margin="0,0,8,0"/>
+            
+            <Button x:Name="ResetButton"
+                    Content="重置为默认"
+                    Style="{StaticResource MaterialDesignOutlinedButton}"
+                    Click="ResetButton_Click"/>
+        </StackPanel>
+
+        <!-- 说明文本 -->
+        <TextBlock Grid.Row="3"
+                   TextWrapping="Wrap"
+                   Style="{StaticResource MaterialDesignBody2TextBlock}"
+                   Foreground="{DynamicResource MaterialDesignBodyLight}">
+            <Run Text="说明："/>
+            <LineBreak/>
+            <Run Text="• 请确保API地址返回的数据格式与默认API兼容"/>
+            <LineBreak/>
+            <Run Text="• 修改设置后将在下次刷新时生效"/>
+            <LineBreak/>
+            <Run Text="• 如果连接失败，请检查网络连接和API地址是否正确"/>
+        </TextBlock>
+    </Grid>
+</ci:ComponentBase>

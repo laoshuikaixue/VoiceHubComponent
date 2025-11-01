@@ -1,4 +1,4 @@
-id: voicehub.broadcast  # 插件 id
+id: laoshui.voicehub  # 插件 id
 name: VoiceHub广播站排期  # 插件名称
 apiVersion: 1.4.2.0  # 插件面向的 ClassIsland 版本
 description: 展示广播站当日排期歌曲，按播放顺序显示歌曲信息  # 插件描述
