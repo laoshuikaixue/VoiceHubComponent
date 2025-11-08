@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media.Animation;
+using System.Windows.Media;
 using System.Windows.Threading;
 using ClassIsland.Core.Abstractions.Controls;
 using ClassIsland.Core.Attributes;
@@ -78,10 +79,8 @@ namespace VoiceHubComponent
         /// </summary>
         private void StartLoadingAnimation()
         {
-            if (_loadingAnimation != null)
-            {
-                _loadingAnimation.Stop();
-            }
+            // 停止之前的动画（如果存在）
+            _loadingAnimation?.Stop();
 
             // 创建旋转动画
             var rotateAnimation = new DoubleAnimation
@@ -90,18 +89,13 @@ namespace VoiceHubComponent
                 To = 360,
                 Duration = TimeSpan.FromMilliseconds(800), // 稍微快一点，800ms一圈
                 RepeatBehavior = RepeatBehavior.Forever
-                // 移除EasingFunction，使用默认的线性动画
             };
 
-            _loadingAnimation = new Storyboard();
-            _loadingAnimation.Children.Add(rotateAnimation);
-            
-            // 设置动画目标
-            Storyboard.SetTarget(rotateAnimation, LoadingRotation);
-            Storyboard.SetTargetProperty(rotateAnimation, new PropertyPath("Angle"));
-
-            // 启动动画
-            _loadingAnimation.Begin();
+            // 直接对 RotateTransform.Angle 属性启动动画，避免 Storyboard 作用域问题
+            if (LoadingRotation != null)
+            {
+                LoadingRotation.BeginAnimation(RotateTransform.AngleProperty, rotateAnimation);
+            }
         }
 
         /// <summary>
@@ -111,10 +105,11 @@ namespace VoiceHubComponent
         {
             _loadingAnimation?.Stop();
             _loadingAnimation = null;
-            
-            // 重置旋转角度
+
+            // 停止并重置旋转角度
             if (LoadingRotation != null)
             {
+                LoadingRotation.BeginAnimation(RotateTransform.AngleProperty, null);
                 LoadingRotation.Angle = 0;
             }
         }
