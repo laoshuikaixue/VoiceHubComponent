@@ -1,0 +1,59 @@
+<ci:ComponentBase x:Class="VoiceHubComponent.Views.VoiceHubSettingsView"
+                x:TypeArguments="models:VoiceHubSettings"
+                x:DataType="models:VoiceHubSettings"
+                xmlns="https://github.com/avaloniaui"
+                xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                xmlns:ci="http://classisland.tech/schemas/xaml/core"
+                xmlns:fluent="clr-namespace:FluentAvalonia.UI.Controls;assembly=FluentAvalonia"
+                xmlns:models="clr-namespace:VoiceHubComponent.Models">
+    <ScrollViewer>
+        <StackPanel Margin="16" Spacing="8">
+            <TextBlock Text="VoiceHub 插件设置" 
+                       FontSize="20"
+                       FontWeight="SemiBold"
+                       Margin="0,0,0,16"/>
+
+            <fluent:SettingsExpander Header="API 地址"
+                                     Description="设置 VoiceHub API 的公开接口地址。"
+                                     IconSource="{ci:FluentIconSource Radio}">
+                <fluent:SettingsExpander.Footer>
+                    <TextBox x:Name="ApiUrlTextBox"
+                             Text="{Binding ApiUrl}"
+                             Watermark="请输入 VoiceHub API 地址"
+                             Width="300"
+                             VerticalAlignment="Center"/>
+                </fluent:SettingsExpander.Footer>
+            </fluent:SettingsExpander>
+            
+            <TextBlock Text="默认: https://voicehub.lao-shui.top/api/songs/public"
+                       FontSize="12"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                       Margin="16,0,0,0"/>
+
+            <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,16,0,0">
+                <Button x:Name="TestConnectionButton"
+                        Content="测试连接"
+                        Classes="accent"
+                        Click="TestConnectionButton_Click"/>
+                
+                <Button x:Name="ResetButton"
+                        Content="重置为默认"
+                        Click="ResetButton_Click"/>
+            </StackPanel>
+
+            <Border Margin="0,16,0,0" 
+                    Padding="12" 
+                    Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    CornerRadius="4">
+                <StackPanel Spacing="4">
+                    <TextBlock Text="说明：" FontWeight="SemiBold"/>
+                    <TextBlock Text="• 请确保API地址返回的数据格式与默认API兼容" TextWrapping="Wrap"/>
+                    <TextBlock Text="• 修改设置后将在下次刷新时生效" TextWrapping="Wrap"/>
+                    <TextBlock Text="• 如果连接失败，请检查网络连接和API地址是否正确" TextWrapping="Wrap"/>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</ci:ComponentBase>

@@ -6,42 +6,68 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Media.Animation;
-using System.Windows.Media;
-using System.Windows.Threading;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Threading;
+using Avalonia.Media;
 using ClassIsland.Core.Abstractions.Controls;
 using ClassIsland.Core.Attributes;
 using VoiceHubComponent.Models;
-using MaterialDesignThemes.Wpf;
 
 namespace VoiceHubComponent
 {
     [ComponentInfo(
         "A1B2C3D4-E5F6-7890-ABCD-EF1234567890",
         "VoiceHub广播站排期",
-        PackIconKind.Radio,
+        "\ue42b",
         "展示VoiceHub广播站当日排期歌曲，按播放顺序显示歌曲信息。"
     )]
-    public partial class VoiceHubControl : ComponentBase
+    public partial class VoiceHubControl : ComponentBase<VoiceHubSettings>
     {
         private readonly HttpClient _httpClient = new HttpClient();
-        private readonly VoiceHubSettings _settings;
         private CancellationTokenSource? _cancellationTokenSource;
         private ComponentState _currentState = ComponentState.Loading;
         private readonly DispatcherTimer _refreshTimer;
-        private Storyboard? _loadingAnimation;
         
+        // UI 状态属性
+        public static readonly DirectProperty<VoiceHubControl, bool> IsLoadingProperty =
+            AvaloniaProperty.RegisterDirect<VoiceHubControl, bool>(nameof(IsLoading), o => o.IsLoading);
+        private bool _isLoading = true;
+        public bool IsLoading { get => _isLoading; private set => SetAndRaise(IsLoadingProperty, ref _isLoading, value); }
+
+        public static readonly DirectProperty<VoiceHubControl, bool> IsDataLoadedProperty =
+            AvaloniaProperty.RegisterDirect<VoiceHubControl, bool>(nameof(IsDataLoaded), o => o.IsDataLoaded);
+        private bool _isDataLoaded = false;
+        public bool IsDataLoaded { get => _isDataLoaded; private set => SetAndRaise(IsDataLoadedProperty, ref _isDataLoaded, value); }
+
+        public static readonly DirectProperty<VoiceHubControl, bool> IsErrorProperty =
+            AvaloniaProperty.RegisterDirect<VoiceHubControl, bool>(nameof(IsError), o => o.IsError);
+        private bool _isError = false;
+        public bool IsError { get => _isError; private set => SetAndRaise(IsErrorProperty, ref _isError, value); }
+
+        public static readonly DirectProperty<VoiceHubControl, string> ContentTextProperty =
+            AvaloniaProperty.RegisterDirect<VoiceHubControl, string>(nameof(ContentText), o => o.ContentText);
+        private string _contentText = "";
+        public string ContentText { get => _contentText; private set => SetAndRaise(ContentTextProperty, ref _contentText, value); }
+
+        public static readonly DirectProperty<VoiceHubControl, string> MessageTextProperty =
+            AvaloniaProperty.RegisterDirect<VoiceHubControl, string>(nameof(MessageText), o => o.MessageText);
+        private string _messageText = "";
+        public string MessageText { get => _messageText; private set => SetAndRaise(MessageTextProperty, ref _messageText, value); }
+
         // 重试逻辑相关字段
         private int _retryCount = 0;
         private const int MaxRetryCount = 3;
         private DateTime _lastFailureTime = DateTime.MinValue;
         private readonly TimeSpan _retryDelay = TimeSpan.FromMinutes(10);
 
-        public VoiceHubControl(VoiceHubSettings settings)
+        // 加载守护：超时自动重试
+        private readonly DispatcherTimer _loadingGuardTimer;
+        private readonly TimeSpan _loadingTimeout = TimeSpan.FromSeconds(15);
+
+        public VoiceHubControl()
         {
             InitializeComponent();
-            _settings = settings;
             
             // 设置HTTP客户端超时
             _httpClient.Timeout = TimeSpan.FromSeconds(10);
@@ -54,64 +80,29 @@ namespace VoiceHubComponent
             _refreshTimer.Tick += async (sender, e) => await RefreshAsync();
             _refreshTimer.Start();
             
-            // 显示加载状态
-            SetState(ComponentState.Loading);
-            
+            // 初始化加载超时守护
+            _loadingGuardTimer = new DispatcherTimer { Interval = _loadingTimeout };
+            _loadingGuardTimer.Tick += async (s, e) =>
+            {
+                _loadingGuardTimer.Stop();
+                SetState(ComponentState.NetworkError, "加载超时，正在重试...");
+                await RefreshAsync();
+            };
+
             // 使用Task.Run确保异步加载在后台线程执行，完全不阻塞UI线程
             Task.Run(async () =>
             {
                 try
                 {
-                    // 添加小延迟确保UI完全初始化
                     await Task.Delay(100);
                     await LoadVoiceHubDataAsync();
                 }
                 catch (Exception)
                 {
-                    // 确保异常不会导致应用崩溃
-                    Dispatcher.Invoke(() => SetState(ComponentState.NetworkError, "广播站排期获取失败"));
+                    await Dispatcher.UIThread.InvokeAsync(() =>
+                        SetState(ComponentState.NetworkError, "广播站排期获取失败"));
                 }
             });
-        }
-
-        /// <summary>
-        /// 启动加载动画
-        /// </summary>
-        private void StartLoadingAnimation()
-        {
-            // 停止之前的动画（如果存在）
-            _loadingAnimation?.Stop();
-
-            // 创建旋转动画
-            var rotateAnimation = new DoubleAnimation
-            {
-                From = 0,
-                To = 360,
-                Duration = TimeSpan.FromMilliseconds(800), // 稍微快一点，800ms一圈
-                RepeatBehavior = RepeatBehavior.Forever
-            };
-
-            // 直接对 RotateTransform.Angle 属性启动动画，避免 Storyboard 作用域问题
-            if (LoadingRotation != null)
-            {
-                LoadingRotation.BeginAnimation(RotateTransform.AngleProperty, rotateAnimation);
-            }
-        }
-
-        /// <summary>
-        /// 停止加载动画
-        /// </summary>
-        private void StopLoadingAnimation()
-        {
-            _loadingAnimation?.Stop();
-            _loadingAnimation = null;
-
-            // 停止并重置旋转角度
-            if (LoadingRotation != null)
-            {
-                LoadingRotation.BeginAnimation(RotateTransform.AngleProperty, null);
-                LoadingRotation.Angle = 0;
-            }
         }
 
         private void UpdateTimerInterval()
@@ -139,7 +130,8 @@ namespace VoiceHubComponent
                 DateTime.Now - _lastFailureTime < _retryDelay)
             {
                 var remainingTime = _retryDelay - (DateTime.Now - _lastFailureTime);
-                SetState(ComponentState.NetworkError, $"等待重试中... ({remainingTime.Minutes}分{remainingTime.Seconds}秒后重试)");
+                await Dispatcher.UIThread.InvokeAsync(() => 
+                    SetState(ComponentState.NetworkError, $"等待重试中... ({remainingTime.Minutes}分{remainingTime.Seconds}秒后重试)"));
                 return;
             }
 
@@ -155,12 +147,19 @@ namespace VoiceHubComponent
                     _lastFailureTime = DateTime.MinValue;
                     
                     // 成功后恢复正常定时器间隔
-                    UpdateTimerInterval();
+                    await Dispatcher.UIThread.InvokeAsync(UpdateTimerInterval);
                     return;
                 }
                 catch (OperationCanceledException)
                 {
-                    // 请求被取消，不需要重试
+                    // 请求被取消：显式切换状态，防止残留“加载中”
+                    await Dispatcher.UIThread.InvokeAsync(() => 
+                    {
+                        SetState(ComponentState.NetworkError, "请求已取消，稍后重试");
+                        UpdateTimerInterval();
+                    });
+                    // 短暂等待后由定时器或守护触发重试
+                    await Task.Delay(1000);
                     return;
                 }
                 catch (Exception ex)
@@ -170,7 +169,8 @@ namespace VoiceHubComponent
                     // 如果还有重试机会
                     if (attempt < MaxRetryCount)
                     {
-                        SetState(ComponentState.NetworkError, $"获取失败，正在重试... ({_retryCount}/{MaxRetryCount})");
+                        await Dispatcher.UIThread.InvokeAsync(() => 
+                            SetState(ComponentState.NetworkError, $"获取失败，正在重试... ({_retryCount}/{MaxRetryCount})"));
                         
                         // 等待一段时间后重试（递增延迟：2秒、4秒、8秒）
                         var retryDelay = TimeSpan.FromSeconds(Math.Pow(2, attempt + 1));
@@ -189,10 +189,11 @@ namespace VoiceHubComponent
                             _ => "获取失败，10分钟后重试"
                         };
                         
-                        SetState(ComponentState.NetworkError, errorMessage);
-                        
-                        // 失败后调整定时器间隔
-                        UpdateTimerInterval();
+                        await Dispatcher.UIThread.InvokeAsync(() => 
+                        {
+                            SetState(ComponentState.NetworkError, errorMessage);
+                            UpdateTimerInterval();
+                        });
                     }
                 }
             }
@@ -205,11 +206,11 @@ namespace VoiceHubComponent
             _cancellationTokenSource = new CancellationTokenSource();
 
             // 设置加载状态
-            SetState(ComponentState.Loading);
+            await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.Loading));
             
             // 使用配置的API地址
-            var apiUrl = !string.IsNullOrEmpty(_settings.ApiUrl) 
-                ? _settings.ApiUrl 
+            var apiUrl = !string.IsNullOrEmpty(Settings.ApiUrl) 
+                ? Settings.ApiUrl 
                 : "https://voicehub.lao-shui.top/api/songs/public";
             
             var jsonResponse = await _httpClient.GetStringAsync(apiUrl, _cancellationTokenSource.Token);
@@ -217,7 +218,7 @@ namespace VoiceHubComponent
 
             if (songItems == null || !songItems.Any())
             {
-                SetState(ComponentState.NoSchedule, "暂无排期数据");
+                await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, "暂无排期数据"));
                 return;
             }
 
@@ -226,7 +227,7 @@ namespace VoiceHubComponent
             
             if (!validItems.Any())
             {
-                SetState(ComponentState.NoSchedule, "暂无有效排期数据");
+                await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, "暂无有效排期数据"));
                 return;
             }
 
@@ -258,109 +259,75 @@ namespace VoiceHubComponent
                 }
                 else
                 {
-                    SetState(ComponentState.NoSchedule, "暂无排期数据");
+                    await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, "暂无排期数据"));
                     return;
                 }
             }
 
             // 验证显示项目的日期一致性
-            var inconsistentItems = displayItems.Where(item => item.GetPlayDate() != actualDate).ToList();
-            if (inconsistentItems.Any())
-            {
-                // 记录日期不一致的问题，但继续显示一致的项目
-                displayItems = displayItems.Where(item => item.GetPlayDate() == actualDate).ToList();
-            }
+            displayItems = displayItems.Where(item => item.GetPlayDate() == actualDate).ToList();
 
             if (!displayItems.Any())
             {
-                SetState(ComponentState.NoSchedule, "排期数据日期不一致");
+                await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, "排期数据日期不一致"));
                 return;
             }
 
-            // 格式化显示内容，使用实际的内容日期
-            var displayText = FormatScheduleDisplay(displayItems, actualDate.ToString("yyyy/MM/dd"));
-            SetState(ComponentState.Normal, displayText);
+            // 格式化显示内容，与 v1 保持一致
+            var sb = new StringBuilder();
+            sb.Append($"广播站排期 | {actualDate:yyyy/MM/dd}: ");
+            
+            var songInfos = new List<string>();
+            foreach (var item in displayItems)
+            {
+                var song = item.Song;
+                songInfos.Add($"#{item.Sequence} {song.Artist} - {song.Title} - {song.Requester}");
+            }
+            sb.Append(string.Join(" | ", songInfos));
+
+            await Dispatcher.UIThread.InvokeAsync(() => 
+            {
+                SetState(ComponentState.Loaded);
+                ContentText = sb.ToString();
+            });
         }
 
         private void SetState(ComponentState state, string? message = null)
         {
             _currentState = state;
             
-            // 确保在UI线程上更新界面
-            if (!Dispatcher.CheckAccess())
-            {
-                Dispatcher.Invoke(() => SetState(state, message));
-                return;
-            }
+            // 更新守护定时器
+            if (state == ComponentState.Loading)
+                _loadingGuardTimer.Start();
+            else
+                _loadingGuardTimer.Stop();
 
-            // 隐藏所有面板
-            LoadingPanel.Visibility = Visibility.Collapsed;
-            VoiceHubText.Visibility = Visibility.Collapsed;
-            ErrorPanel.Visibility = Visibility.Collapsed;
+            // 更新UI元素显示
+            IsLoading = state == ComponentState.Loading;
+            IsDataLoaded = state == ComponentState.Loaded;
+            IsError = state == ComponentState.NetworkError || state == ComponentState.NoSchedule;
 
-            switch (state)
+            if (message != null)
             {
-                case ComponentState.Loading:
-                    LoadingPanel.Visibility = Visibility.Visible;
-                    StartLoadingAnimation(); // 启动加载动画
-                    break;
-                    
-                case ComponentState.Normal:
-                    StopLoadingAnimation(); // 停止加载动画
-                    VoiceHubText.Text = message ?? "";
-                    VoiceHubText.Visibility = Visibility.Visible;
-                    break;
-                    
-                case ComponentState.NetworkError:
-                    StopLoadingAnimation(); // 停止加载动画
-                    ErrorText.Text = message ?? "网络错误";
-                    ErrorPanel.Visibility = Visibility.Visible;
-                    break;
-                    
-                case ComponentState.NoSchedule:
-                    StopLoadingAnimation(); // 停止加载动画
-                    ErrorText.Text = message ?? "暂无排期";
-                    ErrorPanel.Visibility = Visibility.Visible;
-                    break;
+                MessageText = message;
             }
         }
 
-        private string FormatScheduleDisplay(List<SongItem> items, string dateInfo)
-        {
-            var sb = new StringBuilder();
-            sb.Append($"广播站排期 | {dateInfo}: ");
-
-            var songInfos = new List<string>();
-            foreach (var item in items) // 显示所有歌曲
-            {
-                var song = item.Song;
-                songInfos.Add($"#{item.Sequence} {song.Artist} - {song.Title} - {song.Requester}");
-            }
-
-            sb.Append(string.Join(" | ", songInfos));
-
-            return sb.ToString();
-        }
-
-        /// <summary>
-        /// 刷新数据
-        /// </summary>
         public async Task RefreshAsync()
         {
+            // 如果已经在加载中，不重复触发
+            if (_currentState == ComponentState.Loading && _loadingGuardTimer.IsEnabled)
+                return;
+
             await LoadVoiceHubDataAsync();
         }
 
-        /// <summary>
-        /// 清理资源
-        /// </summary>
-        public void Dispose()
+        private enum ComponentState
         {
-            // 停止并清理定时器
-            _refreshTimer?.Stop();
-            
-            // 取消正在进行的请求
-            _cancellationTokenSource?.Cancel();
-            _httpClient?.Dispose();
+            Loading,
+            Loaded,
+            NoSchedule,
+            NetworkError
         }
     }
 }

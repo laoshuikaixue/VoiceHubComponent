@@ -1,0 +1,49 @@
+<ci:ComponentBase
+    x:Class="VoiceHubComponent.VoiceHubControl"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:ci="http://classisland.tech/schemas/xaml/core"
+    xmlns:local="clr-namespace:VoiceHubComponent"
+    xmlns:fluent="clr-namespace:FluentAvalonia.UI.Controls;assembly=FluentAvalonia">
+    
+    <Grid DataContext="{Binding $parent[local:VoiceHubControl]}">
+        <!-- 加载中状态 -->
+        <StackPanel Name="LoadingPanel" 
+                    HorizontalAlignment="Center" 
+                    VerticalAlignment="Center"
+                    Orientation="Horizontal"
+                    IsVisible="{Binding IsLoading}">
+            <fluent:ProgressRing Width="16" Height="16" Margin="0,0,8,0" IsIndeterminate="True" />
+            <TextBlock Text="正在加载..." 
+                       FontSize="{DynamicResource MainWindowBodyFontSize}"
+                       VerticalAlignment="Center"/>
+        </StackPanel>
+
+        <!-- 内容显示 -->
+        <TextBlock Name="VoiceHubText"
+                   HorizontalAlignment="Center"
+                   VerticalAlignment="Center"
+                   FontSize="{DynamicResource MainWindowBodyFontSize}"
+                   IsVisible="{Binding IsDataLoaded}"
+                   Text="{Binding ContentText}"/>
+
+        <!-- 错误状态 -->
+        <StackPanel Name="ErrorPanel" 
+                    HorizontalAlignment="Center" 
+                    VerticalAlignment="Center"
+                    Orientation="Horizontal"
+                    IsVisible="{Binding IsError}">
+            <ci:FluentIcon Glyph="&#xE783;" 
+                           Width="16" 
+                           Height="16"
+                           Foreground="Red"
+                           Margin="0,0,8,0"
+                           VerticalAlignment="Center"/>
+            <TextBlock Name="ErrorText" 
+                       FontSize="{DynamicResource MainWindowBodyFontSize}"
+                       VerticalAlignment="Center"
+                       Foreground="Red"
+                       Text="{Binding MessageText}"/>
+        </StackPanel>
+    </Grid>
+</ci:ComponentBase>
