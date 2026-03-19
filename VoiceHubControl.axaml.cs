@@ -10,6 +10,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Threading;
 using Avalonia.Media;
+using Avalonia.VisualTree;
 using ClassIsland.Core.Abstractions.Controls;
 using ClassIsland.Core.Attributes;
 using VoiceHubComponent.Models;
@@ -24,8 +25,9 @@ namespace VoiceHubComponent
     )]
     public partial class VoiceHubControl : ComponentBase<VoiceHubSettings>
     {
+        private static event Func<Task>? ManualRefreshRequested;
         private readonly HttpClient _httpClient = new HttpClient();
-        private CancellationTokenSource? _cancellationTokenSource;
+        private readonly SemaphoreSlim _refreshLock = new(1, 1);
         private ComponentState _currentState = ComponentState.Loading;
         private readonly DispatcherTimer _refreshTimer;
         
@@ -68,6 +70,8 @@ namespace VoiceHubComponent
         public VoiceHubControl()
         {
             InitializeComponent();
+            ManualRefreshRequested += HandleManualRefreshRequestedAsync;
+            DetachedFromVisualTree += VoiceHubControl_DetachedFromVisualTree;
             
             // 设置HTTP客户端超时
             _httpClient.Timeout = TimeSpan.FromSeconds(10);
@@ -103,6 +107,29 @@ namespace VoiceHubComponent
                         SetState(ComponentState.NetworkError, "广播站排期获取失败"));
                 }
             });
+        }
+
+        public static async Task RequestManualRefreshAsync()
+        {
+            var handlers = ManualRefreshRequested;
+            if (handlers == null)
+                return;
+
+            var tasks = handlers.GetInvocationList()
+                .Cast<Func<Task>>()
+                .Select(handler => handler());
+            await Task.WhenAll(tasks);
+        }
+
+        private async Task HandleManualRefreshRequestedAsync()
+        {
+            await Dispatcher.UIThread.InvokeAsync(async () => await RefreshAsync());
+        }
+
+        private void VoiceHubControl_DetachedFromVisualTree(object? sender, VisualTreeAttachmentEventArgs e)
+        {
+            ManualRefreshRequested -= HandleManualRefreshRequestedAsync;
+            DetachedFromVisualTree -= VoiceHubControl_DetachedFromVisualTree;
         }
 
         private void UpdateTimerInterval()
@@ -150,18 +177,6 @@ namespace VoiceHubComponent
                     await Dispatcher.UIThread.InvokeAsync(UpdateTimerInterval);
                     return;
                 }
-                catch (OperationCanceledException)
-                {
-                    // 请求被取消：显式切换状态，防止残留“加载中”
-                    await Dispatcher.UIThread.InvokeAsync(() => 
-                    {
-                        SetState(ComponentState.NetworkError, "请求已取消，稍后重试");
-                        UpdateTimerInterval();
-                    });
-                    // 短暂等待后由定时器或守护触发重试
-                    await Task.Delay(1000);
-                    return;
-                }
                 catch (Exception ex)
                 {
                     _retryCount = attempt + 1;
@@ -201,10 +216,6 @@ namespace VoiceHubComponent
 
         private async Task LoadVoiceHubDataCoreAsync()
         {
-            // 取消之前的请求
-            _cancellationTokenSource?.Cancel();
-            _cancellationTokenSource = new CancellationTokenSource();
-
             // 设置加载状态
             await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.Loading));
             
@@ -213,7 +224,7 @@ namespace VoiceHubComponent
                 ? Settings.ApiUrl 
                 : "https://voicehub.lao-shui.top/api/songs/public";
             
-            var jsonResponse = await _httpClient.GetStringAsync(apiUrl, _cancellationTokenSource.Token);
+            var jsonResponse = await _httpClient.GetStringAsync(apiUrl);
             var songItems = JsonSerializer.Deserialize<List<SongItem>>(jsonResponse);
 
             if (songItems == null || !songItems.Any())
@@ -315,11 +326,19 @@ namespace VoiceHubComponent
 
         public async Task RefreshAsync()
         {
-            // 如果已经在加载中，不重复触发
-            if (_currentState == ComponentState.Loading && _loadingGuardTimer.IsEnabled)
+            if (!await _refreshLock.WaitAsync(0))
+            {
                 return;
+            }
 
-            await LoadVoiceHubDataAsync();
+            try
+            {
+                await LoadVoiceHubDataAsync();
+            }
+            finally
+            {
+                _refreshLock.Release();
+            }
         }
 
         private enum ComponentState

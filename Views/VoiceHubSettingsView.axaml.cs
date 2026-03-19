@@ -12,6 +12,7 @@ namespace VoiceHubComponent.Views
 {
     public partial class VoiceHubSettingsView : ComponentBase<VoiceHubSettings>
     {
+        private const string DefaultApiUrl = "https://voicehub.lao-shui.top/api/songs/public";
         private readonly HttpClient _httpClient = new HttpClient();
 
         public VoiceHubSettingsView()
@@ -23,6 +24,51 @@ namespace VoiceHubComponent.Views
         {
             InitializeComponent();
             DataContext = settings;
+        }
+
+        private void SaveButton_Click(object sender, RoutedEventArgs e)
+        {
+            var apiUrl = ApiUrlTextBox.Text?.Trim();
+            if (string.IsNullOrEmpty(apiUrl))
+            {
+                this.ShowWarningToast("请输入API地址");
+                return;
+            }
+
+            Settings.ApiUrl = apiUrl;
+            this.ShowSuccessToast("配置已保存");
+        }
+
+        private async void RefreshButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not Button button) return;
+
+            var originalContent = button.Content;
+            button.Content = "刷新中...";
+            button.IsEnabled = false;
+
+            try
+            {
+                var apiUrl = ApiUrlTextBox.Text?.Trim();
+                if (string.IsNullOrEmpty(apiUrl))
+                {
+                    this.ShowWarningToast("请输入API地址");
+                    return;
+                }
+
+                Settings.ApiUrl = apiUrl;
+                await VoiceHubControl.RequestManualRefreshAsync();
+                this.ShowSuccessToast("配置已生效，组件已刷新");
+            }
+            catch (Exception ex)
+            {
+                this.ShowErrorToast($"刷新失败：{ex.Message}");
+            }
+            finally
+            {
+                button.Content = originalContent;
+                button.IsEnabled = true;
+            }
         }
 
         private async void TestConnectionButton_Click(object sender, RoutedEventArgs e)
@@ -84,7 +130,8 @@ namespace VoiceHubComponent.Views
 
         private void ResetButton_Click(object sender, RoutedEventArgs e)
         {
-            Settings.ApiUrl = "https://voicehub.lao-shui.top/api/songs/public";
+            Settings.ApiUrl = DefaultApiUrl;
+            ApiUrlTextBox.Text = DefaultApiUrl;
             this.ShowSuccessToast("已重置为默认API地址");
         }
     }
