@@ -13,7 +13,7 @@ namespace VoiceHubComponent.Models
     {
         private string _apiUrl = "https://voicehub.lao-shui.top/api/songs/public";
         private bool _enableLyrics = false;
-        private string _broadcastStartTime = "17:50:41";
+        private string _broadcastStartTime = "12:20:00";
         private string _neteaseCookie = string.Empty;
         private bool _isLoaded = false;
         private static readonly string SettingsPath = Path.Combine(

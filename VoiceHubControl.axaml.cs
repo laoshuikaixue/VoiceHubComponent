@@ -1614,7 +1614,7 @@ namespace VoiceHubComponent
             var firstSongStart = playbackDate.Date + startTime;
             if (now < firstSongStart)
             {
-                return $"歌词将在 {firstSongStart:HH:mm:ss} 开始 | {_scheduleSummaryText}";
+                return _scheduleSummaryText;
             }
 
             var elapsed = now - firstSongStart;
