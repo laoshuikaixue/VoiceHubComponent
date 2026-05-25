@@ -370,7 +370,7 @@ namespace VoiceHubComponent
             return string.IsNullOrWhiteSpace(value) ? "netease" : value;
         }
 
-        private static DailyLyricCache LoadDailyCache(DateTime date, string scheduleSignature, bool hasNeteaseCookie)
+        private static DailyLyricCache LoadDailyCache(DateTime date, string scheduleSignature, string cookieFingerprint)
         {
             try
             {
@@ -382,20 +382,21 @@ namespace VoiceHubComponent
                     {
                         if (cache.Version != LyricCacheVersion)
                         {
-                            return CreateDailyCache(date, scheduleSignature, hasNeteaseCookie);
+                            return CreateDailyCache(date, scheduleSignature, cookieFingerprint);
                         }
 
                         cache.Entries ??= new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase);
                         cache.Entries = new Dictionary<string, CacheEntry>(cache.Entries, StringComparer.OrdinalIgnoreCase);
                         if (cache.ScheduleSignature != scheduleSignature ||
-                            cache.HasNeteaseCookie != hasNeteaseCookie)
+                            cache.NeteaseCookieFingerprint != cookieFingerprint)
                         {
                             cache.Entries.Clear();
                         }
 
                         cache.Version = LyricCacheVersion;
                         cache.ScheduleSignature = scheduleSignature;
-                        cache.HasNeteaseCookie = hasNeteaseCookie;
+                        cache.HasNeteaseCookie = !string.IsNullOrWhiteSpace(cookieFingerprint);
+                        cache.NeteaseCookieFingerprint = cookieFingerprint;
                         return cache;
                     }
                 }
@@ -405,17 +406,18 @@ namespace VoiceHubComponent
                 // 缓存损坏时直接重建。
             }
 
-            return CreateDailyCache(date, scheduleSignature, hasNeteaseCookie);
+            return CreateDailyCache(date, scheduleSignature, cookieFingerprint);
         }
 
-        private static DailyLyricCache CreateDailyCache(DateTime date, string scheduleSignature, bool hasNeteaseCookie)
+        private static DailyLyricCache CreateDailyCache(DateTime date, string scheduleSignature, string cookieFingerprint)
         {
             return new DailyLyricCache
             {
                 Version = LyricCacheVersion,
                 Date = date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
                 ScheduleSignature = scheduleSignature,
-                HasNeteaseCookie = hasNeteaseCookie,
+                HasNeteaseCookie = !string.IsNullOrWhiteSpace(cookieFingerprint),
+                NeteaseCookieFingerprint = cookieFingerprint,
                 Entries = new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase)
             };
         }
@@ -488,8 +490,8 @@ namespace VoiceHubComponent
 
             var orderedItems = displayItems.OrderBy(item => item.Sequence).ToList();
             var scheduleSignature = BuildScheduleSignature(orderedItems);
-            var hasNeteaseCookie = !string.IsNullOrWhiteSpace(Settings.NeteaseCookie);
-            var cache = LoadDailyCache(actualDate, scheduleSignature, hasNeteaseCookie);
+            var cookieFingerprint = GetNeteaseCookieFingerprint(Settings.NeteaseCookie);
+            var cache = LoadDailyCache(actualDate, scheduleSignature, cookieFingerprint);
             CleanupOldCacheFiles(actualDate);
 
             var currentKeys = orderedItems
@@ -544,7 +546,8 @@ namespace VoiceHubComponent
 
             cache.Date = actualDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             cache.ScheduleSignature = scheduleSignature;
-            cache.HasNeteaseCookie = hasNeteaseCookie;
+            cache.HasNeteaseCookie = !string.IsNullOrWhiteSpace(cookieFingerprint);
+            cache.NeteaseCookieFingerprint = cookieFingerprint;
             SaveDailyCache(actualDate, cache);
 
             lock (_playbackLock)
@@ -1071,6 +1074,11 @@ namespace VoiceHubComponent
         {
             var hash = MD5.HashData(Encoding.UTF8.GetBytes(value));
             return Convert.ToHexString(hash).ToLowerInvariant();
+        }
+
+        private static string GetNeteaseCookieFingerprint(string? cookie)
+        {
+            return string.IsNullOrWhiteSpace(cookie) ? string.Empty : ComputeMd5Hex(cookie.Trim());
         }
 
         private async Task<long> TryGetAudioContentLengthAsync(string audioUrl, CancellationToken token)
@@ -1756,6 +1764,7 @@ namespace VoiceHubComponent
             public string Date { get; set; } = string.Empty;
             public string ScheduleSignature { get; set; } = string.Empty;
             public bool HasNeteaseCookie { get; set; }
+            public string NeteaseCookieFingerprint { get; set; } = string.Empty;
             public Dictionary<string, CacheEntry> Entries { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         }
 
@@ -1772,7 +1781,7 @@ namespace VoiceHubComponent
 
             public bool IsUsable()
             {
-                return DurationMs > 0 || DurationSource == "unresolved";
+                return DurationMs > 0;
             }
 
             public static CacheEntry FromPlayback(string cacheKey, ScheduledSongPlayback playback)
