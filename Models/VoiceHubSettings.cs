@@ -12,6 +12,9 @@ namespace VoiceHubComponent.Models
     public class VoiceHubSettings : INotifyPropertyChanged
     {
         private string _apiUrl = "https://voicehub.lao-shui.top/api/songs/public";
+        private bool _enableLyrics = false;
+        private string _broadcastStartTime = "17:50:41";
+        private string _neteaseCookie = string.Empty;
         private bool _isLoaded = false;
         private static readonly string SettingsPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -33,6 +36,74 @@ namespace VoiceHubComponent.Models
                 if (_apiUrl != value)
                 {
                     _apiUrl = value;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 是否按排期时间显示歌词。
+        /// </summary>
+        public bool EnableLyrics
+        {
+            get
+            {
+                EnsureLoaded();
+                return _enableLyrics;
+            }
+            set
+            {
+                EnsureLoaded();
+                if (_enableLyrics != value)
+                {
+                    _enableLyrics = value;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 当天第一首歌的固定开始播放时间，格式 HH:mm 或 HH:mm:ss。
+        /// </summary>
+        public string BroadcastStartTime
+        {
+            get
+            {
+                EnsureLoaded();
+                return _broadcastStartTime;
+            }
+            set
+            {
+                EnsureLoaded();
+                var normalized = string.IsNullOrWhiteSpace(value) ? "12:20:00" : value.Trim();
+                if (_broadcastStartTime != normalized)
+                {
+                    _broadcastStartTime = normalized;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 网易云音乐 Cookie，用于获取更完整的播放地址和时长信息。
+        /// </summary>
+        public string NeteaseCookie
+        {
+            get
+            {
+                EnsureLoaded();
+                return _neteaseCookie;
+            }
+            set
+            {
+                EnsureLoaded();
+                var normalized = value?.Trim() ?? string.Empty;
+                if (_neteaseCookie != normalized)
+                {
+                    _neteaseCookie = normalized;
                     OnPropertyChanged();
                     SaveSettings();
                 }
@@ -76,6 +147,25 @@ namespace VoiceHubComponent.Models
                         {
                             _apiUrl = apiUrl;
                         }
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("EnableLyrics", out var enableLyricsElement))
+                    {
+                        _enableLyrics = enableLyricsElement.GetBoolean();
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("BroadcastStartTime", out var startTimeElement))
+                    {
+                        var startTime = startTimeElement.GetString();
+                        if (!string.IsNullOrWhiteSpace(startTime))
+                        {
+                            _broadcastStartTime = startTime.Trim();
+                        }
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("NeteaseCookie", out var cookieElement))
+                    {
+                        _neteaseCookie = cookieElement.GetString()?.Trim() ?? string.Empty;
                     }
                 }
             }

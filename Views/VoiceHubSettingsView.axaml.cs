@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Net.Http;
 using System.Threading.Tasks;
 using Avalonia.Controls;
@@ -35,7 +36,15 @@ namespace VoiceHubComponent.Views
                 return;
             }
 
+            if (!TryReadLyricsSettings(out var startTime))
+            {
+                return;
+            }
+
             Settings.ApiUrl = apiUrl;
+            Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
+            Settings.BroadcastStartTime = startTime;
+            Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
             this.ShowSuccessToast("配置已保存");
         }
 
@@ -56,7 +65,15 @@ namespace VoiceHubComponent.Views
                     return;
                 }
 
+                if (!TryReadLyricsSettings(out var startTime))
+                {
+                    return;
+                }
+
                 Settings.ApiUrl = apiUrl;
+                Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
+                Settings.BroadcastStartTime = startTime;
+                Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
                 await VoiceHubControl.RequestManualRefreshAsync();
                 this.ShowSuccessToast("配置已生效，组件已刷新");
             }
@@ -131,8 +148,30 @@ namespace VoiceHubComponent.Views
         private void ResetButton_Click(object sender, RoutedEventArgs e)
         {
             Settings.ApiUrl = DefaultApiUrl;
+            Settings.EnableLyrics = false;
+            Settings.BroadcastStartTime = "12:20:00";
+            Settings.NeteaseCookie = string.Empty;
             ApiUrlTextBox.Text = DefaultApiUrl;
+            EnableLyricsCheckBox.IsChecked = false;
+            BroadcastStartTimeTextBox.Text = "12:20:00";
+            NeteaseCookieTextBox.Text = string.Empty;
             this.ShowSuccessToast("已重置为默认API地址");
+        }
+
+        private bool TryReadLyricsSettings(out string startTime)
+        {
+            startTime = BroadcastStartTimeTextBox.Text?.Trim() ?? string.Empty;
+            if (!TimeSpan.TryParseExact(
+                    startTime,
+                    new[] { @"hh\:mm", @"h\:mm", @"hh\:mm\:ss", @"h\:mm\:ss" },
+                    CultureInfo.InvariantCulture,
+                    out _))
+            {
+                this.ShowWarningToast("固定开始时间格式应为 HH:mm 或 HH:mm:ss");
+                return false;
+            }
+
+            return true;
         }
     }
 }

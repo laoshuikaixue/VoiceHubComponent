@@ -1,9 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
@@ -30,6 +35,26 @@ namespace VoiceHubComponent
         private readonly SemaphoreSlim _refreshLock = new(1, 1);
         private ComponentState _currentState = ComponentState.Loading;
         private readonly DispatcherTimer _refreshTimer;
+        private readonly DispatcherTimer _lyricTimer;
+        private CancellationTokenSource _lyricsCts = new();
+        private List<ScheduledSongPlayback> _playbackPlan = new();
+        private readonly object _playbackLock = new();
+        private DateTime _playbackDate = DateTime.MinValue;
+        private string _scheduleSummaryText = string.Empty;
+        private static readonly Regex LrcTimeRegex = new(@"\[(\d{1,2}):(\d{2})(?:[\.:](\d{1,3}))?\]", RegexOptions.Compiled);
+        private static readonly Regex EnhancedWordRegex = new(@"<(\d{1,2}):(\d{2})(?:[\.:](\d{1,3}))?>([^<]*)", RegexOptions.Compiled);
+        private static readonly Regex QrcLineRegex = new(@"^\[(\d+),(\d+)\](.*)$", RegexOptions.Compiled);
+        private static readonly Regex QrcWordRegex = new(@"([^(]*)\((\d+),(\d+)\)", RegexOptions.Compiled);
+        private static readonly Regex TtmlLineRegex = new(@"<(?:p|span)[^>]*?begin=""([^""]+)""[^>]*?(?:end=""([^""]+)""|dur=""([^""]+)"")?[^>]*>(.*?)</(?:p|span)>", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        private static readonly Regex LrcMetaRegex = new(@"^\[[a-z]+:", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex XmlTagRegex = new(@"<[^>]+>", RegexOptions.Compiled);
+        private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+        private const int LyricCacheVersion = 5;
+        private static readonly TimeSpan MetadataLyricDurationTolerance = TimeSpan.FromSeconds(8);
+        private static readonly TimeSpan LastResortSongDuration = TimeSpan.FromMinutes(4);
+        private static readonly string CacheDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "ClassIsland", "Plugins", "VoiceHubComponent", "Cache");
         
         // UI 状态属性
         public static readonly DirectProperty<VoiceHubControl, bool> IsLoadingProperty =
@@ -65,7 +90,7 @@ namespace VoiceHubComponent
 
         // 加载守护：超时自动重试
         private readonly DispatcherTimer _loadingGuardTimer;
-        private readonly TimeSpan _loadingTimeout = TimeSpan.FromSeconds(15);
+        private readonly TimeSpan _loadingTimeout = TimeSpan.FromSeconds(60);
 
         public VoiceHubControl()
         {
@@ -83,6 +108,13 @@ namespace VoiceHubComponent
             };
             _refreshTimer.Tick += async (sender, e) => await RefreshAsync();
             _refreshTimer.Start();
+
+            _lyricTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(1)
+            };
+            _lyricTimer.Tick += (_, _) => UpdateLyricDisplay();
+            _lyricTimer.Start();
             
             // 初始化加载超时守护
             _loadingGuardTimer = new DispatcherTimer { Interval = _loadingTimeout };
@@ -130,6 +162,11 @@ namespace VoiceHubComponent
         {
             ManualRefreshRequested -= HandleManualRefreshRequestedAsync;
             DetachedFromVisualTree -= VoiceHubControl_DetachedFromVisualTree;
+            _lyricsCts.Cancel();
+            _refreshTimer.Stop();
+            _lyricTimer.Stop();
+            _loadingGuardTimer.Stop();
+            _httpClient.Dispose();
         }
 
         private void UpdateTimerInterval()
@@ -284,23 +321,1379 @@ namespace VoiceHubComponent
                 return;
             }
 
-            // 格式化显示内容，与 v1 保持一致
-            var sb = new StringBuilder();
-            sb.Append($"广播站排期 | {actualDate:yyyy/MM/dd}: ");
-            
-            var songInfos = new List<string>();
-            foreach (var item in displayItems)
-            {
-                var song = item.Song;
-                songInfos.Add($"#{item.Sequence} {song.Artist} - {song.Title} - {song.Requester}");
-            }
-            sb.Append(string.Join(" | ", songInfos));
+            _scheduleSummaryText = BuildScheduleSummary(displayItems, actualDate);
+            await BuildPlaybackPlanAsync(displayItems, actualDate);
 
             await Dispatcher.UIThread.InvokeAsync(() => 
             {
                 SetState(ComponentState.Loaded);
-                ContentText = sb.ToString();
+                ContentText = Settings.EnableLyrics ? GetLyricDisplayText(DateTime.Now) : _scheduleSummaryText;
             });
+        }
+
+        private string BuildScheduleSummary(IReadOnlyList<SongItem> displayItems, DateTime actualDate)
+        {
+            var sb = new StringBuilder();
+            sb.Append($"广播站排期 | {actualDate:yyyy/MM/dd}: ");
+
+            var songInfos = displayItems.Select(item =>
+            {
+                var song = item.Song;
+                return $"#{item.Sequence} {song.Artist} - {song.Title} - {song.Requester}";
+            });
+            sb.Append(string.Join(" | ", songInfos));
+
+            return sb.ToString();
+        }
+
+        private static string BuildScheduleSignature(IEnumerable<SongItem> items)
+        {
+            return string.Join("|", items.Select(item =>
+            {
+                var song = item.Song;
+                var platform = NormalizePlatform(song.MusicPlatform);
+                var musicId = string.IsNullOrWhiteSpace(song.MusicId) ? song.Id.ToString(CultureInfo.InvariantCulture) : song.MusicId.Trim();
+                return $"{item.Id}:{song.Id}:{platform}:{musicId}:{item.Sequence}";
+            }));
+        }
+
+        private static string GetSongCacheKey(Song song)
+        {
+            var platform = NormalizePlatform(song.MusicPlatform);
+            var musicId = string.IsNullOrWhiteSpace(song.MusicId) ? song.Id.ToString(CultureInfo.InvariantCulture) : song.MusicId.Trim();
+            return string.IsNullOrWhiteSpace(musicId) ? string.Empty : $"{platform}:{musicId}";
+        }
+
+        private static string NormalizePlatform(string? platform)
+        {
+            var value = platform?.Trim().ToLowerInvariant();
+            return string.IsNullOrWhiteSpace(value) ? "netease" : value;
+        }
+
+        private static DailyLyricCache LoadDailyCache(DateTime date, string scheduleSignature, bool hasNeteaseCookie)
+        {
+            try
+            {
+                var path = GetCachePath(date);
+                if (File.Exists(path))
+                {
+                    var cache = JsonSerializer.Deserialize<DailyLyricCache>(File.ReadAllText(path), JsonOptions);
+                    if (cache != null)
+                    {
+                        if (cache.Version != LyricCacheVersion)
+                        {
+                            return CreateDailyCache(date, scheduleSignature, hasNeteaseCookie);
+                        }
+
+                        cache.Entries ??= new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase);
+                        cache.Entries = new Dictionary<string, CacheEntry>(cache.Entries, StringComparer.OrdinalIgnoreCase);
+                        if (cache.ScheduleSignature != scheduleSignature ||
+                            cache.HasNeteaseCookie != hasNeteaseCookie)
+                        {
+                            cache.Entries.Clear();
+                        }
+
+                        cache.Version = LyricCacheVersion;
+                        cache.ScheduleSignature = scheduleSignature;
+                        cache.HasNeteaseCookie = hasNeteaseCookie;
+                        return cache;
+                    }
+                }
+            }
+            catch
+            {
+                // 缓存损坏时直接重建。
+            }
+
+            return CreateDailyCache(date, scheduleSignature, hasNeteaseCookie);
+        }
+
+        private static DailyLyricCache CreateDailyCache(DateTime date, string scheduleSignature, bool hasNeteaseCookie)
+        {
+            return new DailyLyricCache
+            {
+                Version = LyricCacheVersion,
+                Date = date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                ScheduleSignature = scheduleSignature,
+                HasNeteaseCookie = hasNeteaseCookie,
+                Entries = new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase)
+            };
+        }
+
+        private static void SaveDailyCache(DateTime date, DailyLyricCache cache)
+        {
+            try
+            {
+                Directory.CreateDirectory(CacheDirectory);
+                cache.Version = LyricCacheVersion;
+                File.WriteAllText(GetCachePath(date), JsonSerializer.Serialize(cache, JsonOptions));
+            }
+            catch
+            {
+                // 缓存只是性能优化，保存失败不影响显示。
+            }
+        }
+
+        private static void CleanupOldCacheFiles(DateTime currentDate)
+        {
+            try
+            {
+                if (!Directory.Exists(CacheDirectory))
+                {
+                    return;
+                }
+
+                var currentFileName = Path.GetFileName(GetCachePath(currentDate));
+                foreach (var file in Directory.EnumerateFiles(CacheDirectory, "lyrics-cache-*.json"))
+                {
+                    if (!string.Equals(Path.GetFileName(file), currentFileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        File.Delete(file);
+                    }
+                }
+            }
+            catch
+            {
+                // 清理失败不影响主流程。
+            }
+        }
+
+        private static string GetCachePath(DateTime date)
+        {
+            return Path.Combine(CacheDirectory, $"lyrics-cache-{date:yyyy-MM-dd}.json");
+        }
+
+        private static void ApplyCacheEntry(ScheduledSongPlayback playback, CacheEntry cacheEntry)
+        {
+            playback.DurationSource = string.IsNullOrWhiteSpace(cacheEntry.DurationSource)
+                ? "fallback"
+                : cacheEntry.DurationSource;
+            playback.Duration = playback.DurationSource == "unresolved"
+                ? TimeSpan.Zero
+                : cacheEntry.DurationMs > 0
+                    ? TimeSpan.FromMilliseconds(cacheEntry.DurationMs)
+                    : LastResortSongDuration;
+            playback.LyricStatus = string.IsNullOrWhiteSpace(cacheEntry.LyricStatus)
+                ? (cacheEntry.Lyrics.Count > 0 ? "ready" : "no-lyrics")
+                : cacheEntry.LyricStatus;
+            playback.Lyrics = cacheEntry.Lyrics.Select(line => line.ToLyricLineItem()).ToList();
+        }
+
+        private async Task BuildPlaybackPlanAsync(IReadOnlyList<SongItem> displayItems, DateTime actualDate)
+        {
+            _lyricsCts.Cancel();
+            _lyricsCts.Dispose();
+            _lyricsCts = new CancellationTokenSource();
+            var token = _lyricsCts.Token;
+
+            var orderedItems = displayItems.OrderBy(item => item.Sequence).ToList();
+            var scheduleSignature = BuildScheduleSignature(orderedItems);
+            var hasNeteaseCookie = !string.IsNullOrWhiteSpace(Settings.NeteaseCookie);
+            var cache = LoadDailyCache(actualDate, scheduleSignature, hasNeteaseCookie);
+            CleanupOldCacheFiles(actualDate);
+
+            var currentKeys = orderedItems
+                .Select(item => GetSongCacheKey(item.Song))
+                .Where(key => !string.IsNullOrWhiteSpace(key))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            cache.Entries = cache.Entries
+                .Where(pair => currentKeys.Contains(pair.Key))
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+
+            var plan = orderedItems
+                .Select(item => new ScheduledSongPlayback(item, LastResortSongDuration))
+                .ToList();
+
+            if (Settings.EnableLyrics)
+            {
+                var metadataGroups = plan
+                    .GroupBy(entry => GetSongCacheKey(entry.Item.Song), StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                foreach (var group in metadataGroups)
+                {
+                    token.ThrowIfCancellationRequested();
+                    var cacheKey = group.Key;
+                    var firstEntry = group.First();
+                    if (!string.IsNullOrWhiteSpace(cacheKey) &&
+                        cache.Entries.TryGetValue(cacheKey, out var cachedEntry) &&
+                        cachedEntry.IsUsable())
+                    {
+                        foreach (var entry in group)
+                        {
+                            ApplyCacheEntry(entry, cachedEntry);
+                        }
+                        continue;
+                    }
+
+                    var resolved = await ResolveSongPlaybackAsync(firstEntry.Item.Song, token);
+                    foreach (var entry in group)
+                    {
+                        entry.Duration = resolved.Duration;
+                        entry.DurationSource = resolved.DurationSource;
+                        entry.Lyrics = resolved.Lyrics.Select(line => line.Clone()).ToList();
+                        entry.LyricStatus = resolved.LyricStatus;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(cacheKey))
+                    {
+                        cache.Entries[cacheKey] = CacheEntry.FromPlayback(cacheKey, firstEntry);
+                    }
+                }
+            }
+
+            cache.Date = actualDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            cache.ScheduleSignature = scheduleSignature;
+            cache.HasNeteaseCookie = hasNeteaseCookie;
+            SaveDailyCache(actualDate, cache);
+
+            lock (_playbackLock)
+            {
+                _playbackDate = actualDate.Date;
+                _playbackPlan = plan;
+            }
+        }
+
+        private async Task<ResolvedPlayback> ResolveSongPlaybackAsync(Song song, CancellationToken token)
+        {
+            var payload = await FetchLyricsAsync(song, token);
+            var lyrics = ParseBestLyrics(payload);
+            if (!string.IsNullOrWhiteSpace(payload.Translation))
+            {
+                AlignTranslations(lyrics, ParseSmartLrc(payload.Translation));
+            }
+
+            var lyricDuration = GetEstimatedDuration(lyrics, TimeSpan.Zero);
+            var officialDuration = await FetchOfficialDurationAsync(song, token);
+            if (officialDuration.Duration > TimeSpan.Zero)
+            {
+                if (IsDurationTrusted(officialDuration.Duration, lyricDuration))
+                {
+                    return new ResolvedPlayback(officialDuration.Duration, officialDuration.Source, lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+                }
+
+                var fallbackAudioDuration = await FetchFallbackAudioDurationAsync(song, lyricDuration, token);
+                if (fallbackAudioDuration.Duration > TimeSpan.Zero)
+                {
+                    return new ResolvedPlayback(fallbackAudioDuration.Duration, fallbackAudioDuration.Source, lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+                }
+
+                return new ResolvedPlayback(TimeSpan.Zero, "unresolved", lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+            }
+
+            var audioDuration = await FetchFallbackAudioDurationAsync(song, lyricDuration, token);
+            if (audioDuration.Duration > TimeSpan.Zero)
+            {
+                return new ResolvedPlayback(audioDuration.Duration, audioDuration.Source, lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+            }
+
+            return new ResolvedPlayback(TimeSpan.Zero, "unresolved", lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+        }
+
+        private async Task<LyricPayload> FetchLyricsAsync(Song song, CancellationToken token)
+        {
+            var platform = song.MusicPlatform?.Trim().ToLowerInvariant();
+            var musicId = string.IsNullOrWhiteSpace(song.MusicId) ? song.Id.ToString(CultureInfo.InvariantCulture) : song.MusicId.Trim();
+            if (string.IsNullOrWhiteSpace(musicId))
+            {
+                return LyricPayload.Empty;
+            }
+
+            try
+            {
+                LyricPayload payload;
+                if (platform == "tencent" || platform == "qq")
+                {
+                    payload = await FetchVkeysLyricsAsync("tencent", musicId, token);
+                }
+                else
+                {
+                    payload = await FetchVoiceHubNeteaseLyricsAsync(musicId, token);
+                    if (string.IsNullOrWhiteSpace(payload.Lrc))
+                    {
+                        payload = await FetchVkeysLyricsAsync("netease", musicId, token);
+                    }
+                }
+
+                return payload;
+            }
+            catch
+            {
+                return LyricPayload.Empty;
+            }
+        }
+
+        private async Task<LyricPayload> FetchVoiceHubNeteaseLyricsAsync(string musicId, CancellationToken token)
+        {
+            var origin = GetVoiceHubOrigin();
+            if (origin == null)
+            {
+                return LyricPayload.Empty;
+            }
+
+            var lyricUrl = new Uri(origin, $"/api/api-enhanced/netease/lyric?id={Uri.EscapeDataString(musicId)}");
+            var lyricNewUrl = new Uri(origin, $"/api/api-enhanced/netease/lyric/new?id={Uri.EscapeDataString(musicId)}");
+            var lrcTask = _httpClient.GetStringAsync(lyricUrl, token);
+            var yrcTask = _httpClient.GetStringAsync(lyricNewUrl, token);
+
+            string? lrc = null;
+            string? translation = null;
+            string? yrc = null;
+
+            try
+            {
+                using var document = JsonDocument.Parse(await lrcTask);
+                var root = document.RootElement;
+                lrc = TryGetNestedString(root, "lrc", "lyric");
+                translation = TryGetNestedString(root, "tlyric", "lyric");
+            }
+            catch
+            {
+                // 歌词接口失败时允许后续备用源兜底。
+            }
+
+            try
+            {
+                using var document = JsonDocument.Parse(await yrcTask);
+                var root = document.RootElement;
+                yrc = TryGetNestedString(root, "yrc", "lyric");
+            }
+            catch
+            {
+                // yrc 不是必需数据。
+            }
+
+            return new LyricPayload(lrc, translation, yrc, null);
+        }
+
+        private async Task<LyricPayload> FetchVkeysLyricsAsync(string platform, string musicId, CancellationToken token)
+        {
+            var lyricUrl = $"https://api.vkeys.cn/v2/music/{platform}/lyric?id={Uri.EscapeDataString(musicId)}";
+            var json = await _httpClient.GetStringAsync(lyricUrl, token);
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+
+            if (!root.TryGetProperty("data", out var data))
+            {
+                return LyricPayload.Empty;
+            }
+
+            var lrc = TryGetString(data, "lrc");
+            var translation = TryGetString(data, "trans");
+            var yrc = TryGetString(data, "yrc");
+            var ttml = TryGetString(data, "ttml");
+            return new LyricPayload(lrc, translation, yrc, ttml);
+        }
+
+        private async Task<DurationProbe> FetchOfficialDurationAsync(Song song, CancellationToken token)
+        {
+            var platform = song.MusicPlatform?.Trim().ToLowerInvariant();
+            var musicId = string.IsNullOrWhiteSpace(song.MusicId) ? song.Id.ToString(CultureInfo.InvariantCulture) : song.MusicId.Trim();
+            if (string.IsNullOrWhiteSpace(musicId))
+            {
+                return DurationProbe.Empty;
+            }
+
+            try
+            {
+                var duration = platform == "tencent" || platform == "qq"
+                    ? await FetchTencentDurationAsync(musicId, token)
+                    : await FetchNeteaseDurationAsync(musicId, token);
+                return duration;
+            }
+            catch
+            {
+                return DurationProbe.Empty;
+            }
+        }
+
+        private async Task<DurationProbe> FetchNeteaseDurationAsync(string musicId, CancellationToken token)
+        {
+            var origin = GetVoiceHubOrigin();
+            if (origin == null)
+            {
+                return DurationProbe.Empty;
+            }
+
+            try
+            {
+                var urlDuration = await FetchNeteaseUrlDurationAsync(origin, musicId, token);
+                if (urlDuration.Duration > TimeSpan.Zero)
+                {
+                    return urlDuration;
+                }
+            }
+            catch
+            {
+                // URL 接口失败时继续尝试详情接口。
+            }
+
+            return await FetchNeteaseDetailDurationAsync(origin, musicId, token);
+        }
+
+        private async Task<DurationProbe> FetchNeteaseUrlDurationAsync(Uri origin, string musicId, CancellationToken token)
+        {
+            var cookie = Settings.NeteaseCookie?.Trim();
+            var query = $"/api/api-enhanced/netease/song/url/v1?id={Uri.EscapeDataString(musicId)}&level=exhigh";
+            query += string.IsNullOrWhiteSpace(cookie)
+                ? "&unblock=true"
+                : $"&unblock=false&cookie={Uri.EscapeDataString(cookie)}";
+            var url = new Uri(origin, query);
+            var json = await _httpClient.GetStringAsync(url, token);
+            using var document = JsonDocument.Parse(json);
+            if (!document.RootElement.TryGetProperty("data", out var dataElement) ||
+                dataElement.ValueKind != JsonValueKind.Array ||
+                dataElement.GetArrayLength() == 0)
+            {
+                return DurationProbe.Empty;
+            }
+
+            var firstSong = dataElement[0];
+            var durationMs = TryGetNumber(firstSong, "time");
+            if (durationMs > 0)
+            {
+                return new DurationProbe(TimeSpan.FromMilliseconds(durationMs), "metadata-url");
+            }
+
+            var estimatedDuration = await EstimateAudioDurationAsync(firstSong, token);
+            return estimatedDuration > TimeSpan.Zero
+                ? new DurationProbe(estimatedDuration, "audio-estimated")
+                : DurationProbe.Empty;
+        }
+
+        private async Task<DurationProbe> FetchFallbackAudioDurationAsync(Song song, TimeSpan lyricDuration, CancellationToken token)
+        {
+            var platform = song.MusicPlatform?.Trim().ToLowerInvariant();
+            var musicId = string.IsNullOrWhiteSpace(song.MusicId) ? song.Id.ToString(CultureInfo.InvariantCulture) : song.MusicId.Trim();
+            if (string.IsNullOrWhiteSpace(musicId) || platform is "tencent" or "qq")
+            {
+                return DurationProbe.Empty;
+            }
+
+            foreach (var fetcher in new Func<string, CancellationToken, Task<DurationProbe>>[]
+                     {
+                         FetchNextMusicDurationAsync,
+                         FetchRrvennDurationAsync,
+                         FetchVkeysNeteaseDurationAsync,
+                         FetchMetingDurationAsync
+                     })
+            {
+                try
+                {
+                    var duration = await fetcher(musicId, token);
+                    if (IsDurationTrusted(duration.Duration, lyricDuration))
+                    {
+                        return duration;
+                    }
+                }
+                catch
+                {
+                    // 单个备用音源失败时继续尝试下一个。
+                }
+            }
+
+            return DurationProbe.Empty;
+        }
+
+        private async Task<DurationProbe> FetchNextMusicDurationAsync(string musicId, CancellationToken token)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://nextmusic.toubiec.cn/api/getSongUrl");
+            AddNextMusicHeaders(request);
+            var body = JsonSerializer.Serialize(new
+            {
+                id = musicId,
+                level = "exhigh",
+                token = GetNextMusicToken()
+            });
+            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+
+            using var response = await _httpClient.SendAsync(request, token);
+            response.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+            if (!document.RootElement.TryGetProperty("data", out var data))
+            {
+                return DurationProbe.Empty;
+            }
+
+            return await ResolveAudioDataDurationAsync(data, "nextmusic-audio", token);
+        }
+
+        private async Task<DurationProbe> FetchRrvennDurationAsync(string musicId, CancellationToken token)
+        {
+            var timestamp = DateTimeOffset.Now.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
+            using var content = new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["action"] = "music",
+                ["url"] = musicId,
+                ["level"] = "exhigh",
+                ["type"] = "json",
+                ["timestamp"] = timestamp,
+                ["signature"] = ComputeMd5Hex(timestamp + "kxz_163music_secret_key_2024")
+            });
+
+            using var response = await _httpClient.PostAsync("https://music.rrvenn.cn/api/api.php", content, token);
+            response.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+            return await ResolveAudioDataDurationAsync(document.RootElement, "rrvenn-audio", token);
+        }
+
+        private async Task<DurationProbe> FetchVkeysNeteaseDurationAsync(string musicId, CancellationToken token)
+        {
+            var url = $"https://api.vkeys.cn/v2/music/netease?id={Uri.EscapeDataString(musicId)}&quality=4";
+            var json = await _httpClient.GetStringAsync(url, token);
+            using var document = JsonDocument.Parse(json);
+            if (!document.RootElement.TryGetProperty("data", out var data))
+            {
+                return DurationProbe.Empty;
+            }
+
+            return await ResolveAudioDataDurationAsync(data, "vkeys-audio", token);
+        }
+
+        private async Task<DurationProbe> FetchMetingDurationAsync(string musicId, CancellationToken token)
+        {
+            foreach (var baseUrl in new[] { "https://api.qijieya.cn/meting", "https://api.obdo.cc/meting" })
+            {
+                try
+                {
+                    var url = $"{baseUrl}/?server=netease&type=song&id={Uri.EscapeDataString(musicId)}";
+                    var json = await _httpClient.GetStringAsync(url, token);
+                    using var document = JsonDocument.Parse(json);
+                    var data = document.RootElement.ValueKind == JsonValueKind.Array && document.RootElement.GetArrayLength() > 0
+                        ? document.RootElement[0]
+                        : document.RootElement;
+                    var duration = await ResolveAudioDataDurationAsync(data, "meting-audio", token);
+                    if (duration.Duration > TimeSpan.Zero)
+                    {
+                        return duration;
+                    }
+                }
+                catch
+                {
+                    // 继续尝试下一个 Meting 源。
+                }
+            }
+
+            return DurationProbe.Empty;
+        }
+
+        private async Task<DurationProbe> ResolveAudioDataDurationAsync(JsonElement data, string source, CancellationToken token)
+        {
+            var estimatedDuration = await EstimateAudioDurationAsync(data, token);
+            if (estimatedDuration > TimeSpan.Zero)
+            {
+                return new DurationProbe(estimatedDuration, source);
+            }
+
+            var directDuration = TryReadDuration(data);
+            return directDuration > TimeSpan.Zero
+                ? new DurationProbe(directDuration, source)
+                : DurationProbe.Empty;
+        }
+
+        private async Task<TimeSpan> EstimateAudioDurationAsync(JsonElement songUrlData, CancellationToken token)
+        {
+            var bitrate = TryGetNumber(songUrlData, "br");
+            var size = TryGetNumber(songUrlData, "size");
+            if (bitrate > 0 && size > 0)
+            {
+                return TimeSpan.FromSeconds(size * 8 / bitrate);
+            }
+
+            var audioUrl = TryGetString(songUrlData, "url");
+            if (string.IsNullOrWhiteSpace(audioUrl))
+            {
+                return TimeSpan.Zero;
+            }
+
+            return await EstimateAudioDurationFromUrlAsync(audioUrl, bitrate, token);
+        }
+
+        private async Task<TimeSpan> EstimateAudioDurationFromUrlAsync(string audioUrl, double bitrate, CancellationToken token)
+        {
+            try
+            {
+                var contentLength = await TryGetAudioContentLengthAsync(audioUrl, token);
+                if (contentLength <= 0)
+                {
+                    return TimeSpan.Zero;
+                }
+
+                var trustedBitrate = bitrate > 0 ? bitrate : await TryReadMp3BitrateAsync(audioUrl, token);
+                return trustedBitrate > 0
+                    ? TimeSpan.FromSeconds(contentLength * 8d / trustedBitrate)
+                    : TimeSpan.Zero;
+            }
+            catch
+            {
+                return TimeSpan.Zero;
+            }
+        }
+
+        private async Task<DurationProbe> FetchNeteaseDetailDurationAsync(Uri origin, string musicId, CancellationToken token)
+        {
+            var detailUrl = new Uri(origin, $"/api/api-enhanced/netease/song/detail?ids={Uri.EscapeDataString(musicId)}");
+            var json = await _httpClient.GetStringAsync(detailUrl, token);
+            using var document = JsonDocument.Parse(json);
+            if (!document.RootElement.TryGetProperty("songs", out var songsElement) ||
+                songsElement.ValueKind != JsonValueKind.Array ||
+                songsElement.GetArrayLength() == 0)
+            {
+                return DurationProbe.Empty;
+            }
+
+            var firstSong = songsElement[0];
+            var durationMs = TryGetNumber(firstSong, "dt");
+            return durationMs > 0
+                ? new DurationProbe(TimeSpan.FromMilliseconds(durationMs), "metadata")
+                : DurationProbe.Empty;
+        }
+
+        private async Task<DurationProbe> FetchTencentDurationAsync(string musicId, CancellationToken token)
+        {
+            var detailUrl = $"https://api.vkeys.cn/v2/music/tencent?id={Uri.EscapeDataString(musicId)}";
+            var json = await _httpClient.GetStringAsync(detailUrl, token);
+            using var document = JsonDocument.Parse(json);
+            if (!document.RootElement.TryGetProperty("data", out var data))
+            {
+                return DurationProbe.Empty;
+            }
+
+            var duration = TryGetNumber(data, "duration");
+            if (duration <= 0)
+            {
+                duration = TryGetNumber(data, "interval");
+            }
+
+            if (duration <= 0)
+            {
+                return DurationProbe.Empty;
+            }
+
+            // Vkeys QQ 音乐通常返回秒；异常偏大的值按毫秒处理。
+            var durationValue = duration > 10_000 ? TimeSpan.FromMilliseconds(duration) : TimeSpan.FromSeconds(duration);
+            return new DurationProbe(durationValue, "metadata");
+        }
+
+        private Uri? GetVoiceHubOrigin()
+        {
+            if (!Uri.TryCreate(Settings.ApiUrl, UriKind.Absolute, out var apiUri))
+            {
+                return null;
+            }
+
+            return new Uri(apiUri.GetLeftPart(UriPartial.Authority));
+        }
+
+        private static string? TryGetNestedString(JsonElement root, string objectName, string propertyName)
+        {
+            return root.TryGetProperty(objectName, out var nested)
+                ? TryGetString(nested, propertyName)
+                : null;
+        }
+
+        private static string? TryGetString(JsonElement element, string propertyName)
+        {
+            return element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
+        }
+
+        private static double TryGetNumber(JsonElement element, string propertyName)
+        {
+            if (!element.TryGetProperty(propertyName, out var value))
+            {
+                return 0;
+            }
+
+            return value.ValueKind switch
+            {
+                JsonValueKind.Number when value.TryGetDouble(out var number) => number,
+                JsonValueKind.String when double.TryParse(value.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var number) => number,
+                _ => 0
+            };
+        }
+
+        private static TimeSpan TryReadDuration(JsonElement element)
+        {
+            var timeMs = TryGetNumber(element, "time");
+            if (timeMs > 0)
+            {
+                return TimeSpan.FromMilliseconds(timeMs);
+            }
+
+            var duration = TryGetNumber(element, "duration");
+            if (duration <= 0)
+            {
+                duration = TryGetNumber(element, "interval");
+            }
+
+            if (duration <= 0)
+            {
+                return TimeSpan.Zero;
+            }
+
+            return duration > 10_000 ? TimeSpan.FromMilliseconds(duration) : TimeSpan.FromSeconds(duration);
+        }
+
+        private static bool IsDurationTrusted(TimeSpan duration, TimeSpan lyricDuration)
+        {
+            if (duration <= TimeSpan.Zero)
+            {
+                return false;
+            }
+
+            if (lyricDuration <= TimeSpan.Zero)
+            {
+                return true;
+            }
+
+            var tolerance = TimeSpan.FromMilliseconds(Math.Max(
+                MetadataLyricDurationTolerance.TotalMilliseconds,
+                lyricDuration.TotalMilliseconds * 0.15));
+            return duration + tolerance >= lyricDuration;
+        }
+
+        private static void AddNextMusicHeaders(HttpRequestMessage request)
+        {
+            request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+            request.Headers.TryAddWithoutValidation("Origin", "https://nextmusic.toubiec.cn");
+            request.Headers.TryAddWithoutValidation("Referer", "https://nextmusic.toubiec.cn/");
+        }
+
+        private static string GetNextMusicToken()
+        {
+            var currentMinute = DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 60;
+            return ComputeMd5Hex($"suxiaoqings:{currentMinute}");
+        }
+
+        private static string ComputeMd5Hex(string value)
+        {
+            var hash = MD5.HashData(Encoding.UTF8.GetBytes(value));
+            return Convert.ToHexString(hash).ToLowerInvariant();
+        }
+
+        private async Task<long> TryGetAudioContentLengthAsync(string audioUrl, CancellationToken token)
+        {
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Head, audioUrl);
+                using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+                if (response.Content.Headers.ContentLength is long contentLength && contentLength > 0)
+                {
+                    return contentLength;
+                }
+            }
+            catch
+            {
+                // 有些音源不支持 HEAD，继续尝试 Range 请求。
+            }
+
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, audioUrl);
+                request.Headers.Range = new RangeHeaderValue(0, 0);
+                using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+                return response.Content.Headers.ContentRange?.Length
+                       ?? response.Content.Headers.ContentLength
+                       ?? 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private async Task<double> TryReadMp3BitrateAsync(string audioUrl, CancellationToken token)
+        {
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, audioUrl);
+                request.Headers.Range = new RangeHeaderValue(0, 65535);
+                using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+                var bytes = await response.Content.ReadAsByteArrayAsync(token);
+                return TryReadMp3Bitrate(bytes);
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private static double TryReadMp3Bitrate(byte[] bytes)
+        {
+            for (var i = 0; i < bytes.Length - 3; i++)
+            {
+                if (bytes[i] != 0xFF || (bytes[i + 1] & 0xE0) != 0xE0)
+                {
+                    continue;
+                }
+
+                var versionBits = (bytes[i + 1] >> 3) & 0x03;
+                var layerBits = (bytes[i + 1] >> 1) & 0x03;
+                var bitrateIndex = (bytes[i + 2] >> 4) & 0x0F;
+                if (versionBits == 1 || layerBits == 0 || bitrateIndex is 0 or 15)
+                {
+                    continue;
+                }
+
+                var kbps = GetMp3BitrateKbps(versionBits, layerBits, bitrateIndex);
+                if (kbps > 0)
+                {
+                    return kbps * 1000d;
+                }
+            }
+
+            return 0;
+        }
+
+        private static int GetMp3BitrateKbps(int versionBits, int layerBits, int bitrateIndex)
+        {
+            int[] mpeg1Layer1 = { 0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0 };
+            int[] mpeg1Layer2 = { 0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0 };
+            int[] mpeg1Layer3 = { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 };
+            int[] mpeg2Layer1 = { 0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0 };
+            int[] mpeg2Layer23 = { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 };
+
+            return versionBits == 3
+                ? layerBits switch
+                {
+                    3 => mpeg1Layer1[bitrateIndex],
+                    2 => mpeg1Layer2[bitrateIndex],
+                    1 => mpeg1Layer3[bitrateIndex],
+                    _ => 0
+                }
+                : layerBits == 3
+                    ? mpeg2Layer1[bitrateIndex]
+                    : mpeg2Layer23[bitrateIndex];
+        }
+
+        private static List<LyricLineItem> ParseBestLyrics(LyricPayload payload)
+        {
+            if (!string.IsNullOrWhiteSpace(payload.Ttml))
+            {
+                var ttmlLines = ParseTtml(payload.Ttml);
+                if (ttmlLines.Count > 0)
+                {
+                    return ttmlLines;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(payload.Yrc))
+            {
+                var qrcLines = ParseQrc(payload.Yrc);
+                if (qrcLines.Count > 0)
+                {
+                    return qrcLines;
+                }
+
+                var yrcLines = ParseSmartLrc(payload.Yrc);
+                if (yrcLines.Count > 0)
+                {
+                    return yrcLines;
+                }
+            }
+
+            return ParseSmartLrc(payload.Lrc);
+        }
+
+        private static List<LyricLineItem> ParseSmartLrc(string? lrc)
+        {
+            if (string.IsNullOrWhiteSpace(lrc))
+            {
+                return new List<LyricLineItem>();
+            }
+
+            if (lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                .Any(line => EnhancedWordRegex.IsMatch(line)))
+            {
+                var enhancedLines = ParseEnhancedLrc(lrc);
+                if (enhancedLines.Count > 0)
+                {
+                    return enhancedLines;
+                }
+            }
+
+            if (lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                .Any(line => LrcTimeRegex.Matches(line).Count > 1))
+            {
+                var wordByWordLines = ParseWordByWordLrc(lrc);
+                if (wordByWordLines.Count > 0)
+                {
+                    return wordByWordLines;
+                }
+            }
+
+            return ParseLineLrc(lrc);
+        }
+
+        private static List<LyricLineItem> ParseLineLrc(string? lrc)
+        {
+            var result = new List<LyricLineItem>();
+            if (string.IsNullOrWhiteSpace(lrc))
+            {
+                return result;
+            }
+
+            foreach (var rawLine in lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+            {
+                var line = rawLine.Trim();
+                if (string.IsNullOrEmpty(line) || LrcMetaRegex.IsMatch(line))
+                {
+                    continue;
+                }
+
+                var matches = LrcTimeRegex.Matches(line);
+                if (matches.Count == 0)
+                {
+                    continue;
+                }
+
+                var text = LrcTimeRegex.Replace(line, string.Empty).Trim();
+                if (string.IsNullOrEmpty(text))
+                {
+                    continue;
+                }
+
+                foreach (Match match in matches)
+                {
+                    result.Add(new LyricLineItem
+                    {
+                        Start = ParseLrcTimestamp(match),
+                        Text = text
+                    });
+                }
+            }
+
+            result = result.OrderBy(line => line.Start).ToList();
+            for (var i = 0; i < result.Count; i++)
+            {
+                result[i].End = i + 1 < result.Count
+                    ? result[i + 1].Start
+                    : result[i].Start + TimeSpan.FromSeconds(5);
+            }
+
+            return result;
+        }
+
+        private static List<LyricLineItem> ParseWordByWordLrc(string lrc)
+        {
+            var result = new List<LyricLineItem>();
+            foreach (var rawLine in lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+            {
+                var line = rawLine.Trim();
+                if (string.IsNullOrEmpty(line) || LrcMetaRegex.IsMatch(line))
+                {
+                    continue;
+                }
+
+                var matches = LrcTimeRegex.Matches(line).Cast<Match>().ToList();
+                if (matches.Count == 0)
+                {
+                    continue;
+                }
+
+                var segments = new List<(TimeSpan Start, string Text)>();
+                for (var i = 0; i < matches.Count; i++)
+                {
+                    var match = matches[i];
+                    var contentStart = match.Index + match.Length;
+                    var contentEnd = i + 1 < matches.Count ? matches[i + 1].Index : line.Length;
+                    var text = line[contentStart..contentEnd];
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        segments.Add((ParseLrcTimestamp(match), text));
+                    }
+                }
+
+                if (segments.Count == 0)
+                {
+                    continue;
+                }
+
+                var lineText = string.Concat(segments.Select(segment => segment.Text)).Trim();
+                if (string.IsNullOrEmpty(lineText))
+                {
+                    continue;
+                }
+
+                result.Add(new LyricLineItem
+                {
+                    Start = segments.Min(segment => segment.Start),
+                    End = segments.Last().Start + TimeSpan.FromSeconds(1),
+                    Text = lineText
+                });
+            }
+
+            CompleteLineEndTimes(result);
+            return result;
+        }
+
+        private static List<LyricLineItem> ParseEnhancedLrc(string lrc)
+        {
+            var result = new List<LyricLineItem>();
+            foreach (var rawLine in lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+            {
+                var line = rawLine.Trim();
+                if (string.IsNullOrEmpty(line) || LrcMetaRegex.IsMatch(line))
+                {
+                    continue;
+                }
+
+                var lineMatch = LrcTimeRegex.Match(line);
+                if (!lineMatch.Success)
+                {
+                    continue;
+                }
+
+                var contentAfterLineTime = line[(lineMatch.Index + lineMatch.Length)..];
+                var wordMatches = EnhancedWordRegex.Matches(contentAfterLineTime).Cast<Match>().ToList();
+                var text = wordMatches.Count > 0
+                    ? string.Concat(wordMatches.Select(match => match.Groups[4].Value)).Trim()
+                    : EnhancedWordRegex.Replace(contentAfterLineTime, string.Empty).Trim();
+
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    continue;
+                }
+
+                var start = ParseLrcTimestamp(lineMatch);
+                var end = wordMatches.Count > 0
+                    ? ParseEnhancedTimestamp(wordMatches.Last()) + TimeSpan.FromSeconds(1)
+                    : start + TimeSpan.FromSeconds(1);
+
+                result.Add(new LyricLineItem { Start = start, End = end, Text = text });
+            }
+
+            CompleteLineEndTimes(result);
+            return result;
+        }
+
+        private static List<LyricLineItem> ParseQrc(string? content)
+        {
+            var result = new List<LyricLineItem>();
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                return result;
+            }
+
+            var rawContent = ExtractQrcLyricContent(content) ?? content;
+            foreach (var rawLine in rawContent.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+            {
+                var line = rawLine.Trim();
+                if (string.IsNullOrEmpty(line) || LrcMetaRegex.IsMatch(line))
+                {
+                    continue;
+                }
+
+                var lineMatch = QrcLineRegex.Match(line);
+                if (!lineMatch.Success)
+                {
+                    continue;
+                }
+
+                var startMs = long.Parse(lineMatch.Groups[1].Value, CultureInfo.InvariantCulture);
+                var durationMs = long.Parse(lineMatch.Groups[2].Value, CultureInfo.InvariantCulture);
+                var lineContent = lineMatch.Groups[3].Value;
+                var words = QrcWordRegex.Matches(lineContent)
+                    .Cast<Match>()
+                    .Select(match => match.Groups[1].Value)
+                    .Where(word => !string.IsNullOrEmpty(word));
+                var text = string.Concat(words).Trim();
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    continue;
+                }
+
+                result.Add(new LyricLineItem
+                {
+                    Start = TimeSpan.FromMilliseconds(startMs),
+                    End = TimeSpan.FromMilliseconds(startMs + durationMs),
+                    Text = text
+                });
+            }
+
+            CompleteLineEndTimes(result);
+            return result;
+        }
+
+        private static List<LyricLineItem> ParseTtml(string? content)
+        {
+            var result = new List<LyricLineItem>();
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                return result;
+            }
+
+            foreach (Match match in TtmlLineRegex.Matches(content))
+            {
+                var text = DecodeXmlText(XmlTagRegex.Replace(match.Groups[4].Value, string.Empty)).Trim();
+                if (string.IsNullOrWhiteSpace(text) || !TryParseTtmlTime(match.Groups[1].Value, out var start))
+                {
+                    continue;
+                }
+
+                TimeSpan end;
+                if (match.Groups[2].Success && TryParseTtmlTime(match.Groups[2].Value, out var explicitEnd))
+                {
+                    end = explicitEnd;
+                }
+                else if (match.Groups[3].Success && TryParseTtmlTime(match.Groups[3].Value, out var duration))
+                {
+                    end = start + duration;
+                }
+                else
+                {
+                    end = start + TimeSpan.FromSeconds(5);
+                }
+
+                result.Add(new LyricLineItem { Start = start, End = end, Text = text });
+            }
+
+            CompleteLineEndTimes(result);
+            return result;
+        }
+
+        private static TimeSpan ParseLrcTimestamp(Match match)
+        {
+            var minutes = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+            var seconds = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
+            var millisecondsText = match.Groups[3].Success ? match.Groups[3].Value : "0";
+            var normalizedMilliseconds = millisecondsText.PadRight(3, '0')[..3];
+            var milliseconds = int.Parse(normalizedMilliseconds, CultureInfo.InvariantCulture);
+            return TimeSpan.FromMilliseconds(minutes * 60_000 + seconds * 1_000 + milliseconds);
+        }
+
+        private static TimeSpan ParseEnhancedTimestamp(Match match)
+        {
+            var minutes = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+            var seconds = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
+            var millisecondsText = match.Groups[3].Success ? match.Groups[3].Value : "0";
+            var normalizedMilliseconds = millisecondsText.PadRight(3, '0')[..3];
+            var milliseconds = int.Parse(normalizedMilliseconds, CultureInfo.InvariantCulture);
+            return TimeSpan.FromMilliseconds(minutes * 60_000 + seconds * 1_000 + milliseconds);
+        }
+
+        private static void CompleteLineEndTimes(List<LyricLineItem> lines)
+        {
+            lines.Sort((a, b) => a.Start.CompareTo(b.Start));
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var nextLine = i + 1 < lines.Count ? lines[i + 1] : null;
+                if (nextLine != null && (lines[i].End <= lines[i].Start || lines[i].End > nextLine.Start))
+                {
+                    lines[i].End = nextLine.Start;
+                }
+                else if (lines[i].End <= lines[i].Start)
+                {
+                    lines[i].End = lines[i].Start + TimeSpan.FromSeconds(5);
+                }
+            }
+        }
+
+        private static string? ExtractQrcLyricContent(string rawContent)
+        {
+            var match = Regex.Match(rawContent, "LyricContent=\"([\\s\\S]*?)\"", RegexOptions.IgnoreCase);
+            if (!match.Success)
+            {
+                return null;
+            }
+
+            return DecodeXmlText(match.Groups[1].Value)
+                .Replace("\\n", "\n")
+                .Replace("\\r", "\r");
+        }
+
+        private static bool TryParseTtmlTime(string value, out TimeSpan time)
+        {
+            value = value.Trim();
+            if (TimeSpan.TryParse(value, CultureInfo.InvariantCulture, out time))
+            {
+                return true;
+            }
+
+            if (value.EndsWith("ms", StringComparison.OrdinalIgnoreCase) &&
+                double.TryParse(value[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out var milliseconds))
+            {
+                time = TimeSpan.FromMilliseconds(milliseconds);
+                return true;
+            }
+
+            if (value.EndsWith("s", StringComparison.OrdinalIgnoreCase) &&
+                double.TryParse(value[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds))
+            {
+                time = TimeSpan.FromSeconds(seconds);
+                return true;
+            }
+
+            time = TimeSpan.Zero;
+            return false;
+        }
+
+        private static string DecodeXmlText(string value)
+        {
+            return value
+                .Replace("&quot;", "\"")
+                .Replace("&apos;", "'")
+                .Replace("&lt;", "<")
+                .Replace("&gt;", ">")
+                .Replace("&amp;", "&");
+        }
+
+        private static void AlignTranslations(List<LyricLineItem> lyrics, IReadOnlyList<LyricLineItem> translations)
+        {
+            var i = 0;
+            var j = 0;
+            var tolerance = TimeSpan.FromMilliseconds(300);
+
+            while (i < lyrics.Count && j < translations.Count)
+            {
+                var diff = lyrics[i].Start - translations[j].Start;
+                if (diff.Duration() <= tolerance)
+                {
+                    lyrics[i].Translation = translations[j].Text;
+                    i++;
+                    j++;
+                }
+                else if (diff < TimeSpan.Zero)
+                {
+                    i++;
+                }
+                else
+                {
+                    j++;
+                }
+            }
+        }
+
+        private static TimeSpan GetEstimatedDuration(IReadOnlyList<LyricLineItem> lyrics, TimeSpan fallback)
+        {
+            if (lyrics.Count == 0)
+            {
+                return fallback;
+            }
+
+            var lastLineEnd = lyrics.Max(line => line.End);
+            return lastLineEnd > TimeSpan.FromSeconds(30) ? lastLineEnd + TimeSpan.FromSeconds(3) : fallback;
+        }
+
+        private void UpdateLyricDisplay()
+        {
+            if (_currentState != ComponentState.Loaded)
+            {
+                return;
+            }
+
+            ContentText = Settings.EnableLyrics ? GetLyricDisplayText(DateTime.Now) : _scheduleSummaryText;
+        }
+
+        private string GetLyricDisplayText(DateTime now)
+        {
+            List<ScheduledSongPlayback> plan;
+            DateTime playbackDate;
+            lock (_playbackLock)
+            {
+                plan = _playbackPlan.ToList();
+                playbackDate = _playbackDate;
+            }
+
+            if (plan.Count == 0 || playbackDate == DateTime.MinValue)
+            {
+                return _scheduleSummaryText;
+            }
+
+            var startTime = ResolveBroadcastStartTime(plan);
+            var firstSongStart = playbackDate.Date + startTime;
+            if (now < firstSongStart)
+            {
+                return $"歌词将在 {firstSongStart:HH:mm:ss} 开始 | {_scheduleSummaryText}";
+            }
+
+            var elapsed = now - firstSongStart;
+            var cursor = TimeSpan.Zero;
+
+            foreach (var entry in plan)
+            {
+                if (!entry.HasReliableDuration)
+                {
+                    return string.Empty;
+                }
+
+                var start = cursor;
+                var end = cursor + entry.Duration;
+                if (elapsed >= start && elapsed < end)
+                {
+                    return BuildCurrentLyricText(entry, elapsed - start);
+                }
+
+                cursor = end;
+            }
+
+            return $"今日排期已播放完毕 | {_scheduleSummaryText}";
+        }
+
+        private TimeSpan ResolveBroadcastStartTime(IReadOnlyList<ScheduledSongPlayback> plan)
+        {
+            if (TryParseClockTime(Settings.BroadcastStartTime, out var configuredStart))
+            {
+                return configuredStart;
+            }
+
+            var playTimeStart = plan.FirstOrDefault()?.Item.PlayTime?.StartTime;
+            if (TryParseClockTime(playTimeStart, out var scheduleStart))
+            {
+                return scheduleStart;
+            }
+
+            return TimeSpan.Zero;
+        }
+
+        private static bool TryParseClockTime(string? value, out TimeSpan time)
+        {
+            if (!string.IsNullOrWhiteSpace(value) &&
+                TimeSpan.TryParseExact(
+                    value.Trim(),
+                    new[] { @"hh\:mm", @"h\:mm", @"hh\:mm\:ss", @"h\:mm\:ss" },
+                    CultureInfo.InvariantCulture,
+                    out time))
+            {
+                return true;
+            }
+
+            time = TimeSpan.Zero;
+            return false;
+        }
+
+        private string BuildCurrentLyricText(ScheduledSongPlayback entry, TimeSpan songPosition)
+        {
+            var song = entry.Item.Song;
+            var prefix = $"♪ #{entry.Item.Sequence} {song.Artist} - {song.Title}";
+
+            if (entry.Lyrics.Count == 0)
+            {
+                return entry.LyricStatus == "loading"
+                    ? $"{prefix} | 歌词加载中"
+                    : $"{prefix} | 暂无歌词{BuildDurationStatusSuffix(entry)}";
+            }
+
+            var currentLine = entry.Lyrics.LastOrDefault(line => songPosition >= line.Start);
+            if (currentLine == null)
+            {
+                return $"{prefix} | 前奏";
+            }
+
+            var lyricText = currentLine.Text;
+            if (!string.IsNullOrWhiteSpace(currentLine.Translation))
+            {
+                lyricText += $" / {currentLine.Translation}";
+            }
+
+            return $"{prefix} | {lyricText}{BuildDurationStatusSuffix(entry)}";
+        }
+
+        private static string BuildDurationStatusSuffix(ScheduledSongPlayback entry)
+        {
+            return entry.DurationSource == "fallback" ? "（时长估算）" : string.Empty;
         }
 
         private void SetState(ComponentState state, string? message = null)
@@ -339,6 +1732,109 @@ namespace VoiceHubComponent
             {
                 _refreshLock.Release();
             }
+        }
+
+        private sealed record LyricPayload(string? Lrc, string? Translation, string? Yrc, string? Ttml)
+        {
+            public static LyricPayload Empty { get; } = new(null, null, null, null);
+        }
+
+        private sealed record ResolvedPlayback(
+            TimeSpan Duration,
+            string DurationSource,
+            List<LyricLineItem> Lyrics,
+            string LyricStatus);
+
+        private sealed record DurationProbe(TimeSpan Duration, string Source)
+        {
+            public static readonly DurationProbe Empty = new(TimeSpan.Zero, string.Empty);
+        }
+
+        private sealed class DailyLyricCache
+        {
+            public int Version { get; set; } = LyricCacheVersion;
+            public string Date { get; set; } = string.Empty;
+            public string ScheduleSignature { get; set; } = string.Empty;
+            public bool HasNeteaseCookie { get; set; }
+            public Dictionary<string, CacheEntry> Entries { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private sealed class CacheEntry
+        {
+            public string CacheKey { get; set; } = string.Empty;
+            public string Title { get; set; } = string.Empty;
+            public string Artist { get; set; } = string.Empty;
+            public double DurationMs { get; set; }
+            public string DurationSource { get; set; } = "fallback";
+            public string LyricStatus { get; set; } = "no-lyrics";
+            public DateTime UpdatedAt { get; set; } = DateTime.Now;
+            public List<CachedLyricLine> Lyrics { get; set; } = new();
+
+            public bool IsUsable()
+            {
+                return DurationMs > 0 || DurationSource == "unresolved";
+            }
+
+            public static CacheEntry FromPlayback(string cacheKey, ScheduledSongPlayback playback)
+            {
+                return new CacheEntry
+                {
+                    CacheKey = cacheKey,
+                    Title = playback.Item.Song.Title,
+                    Artist = playback.Item.Song.Artist,
+                    DurationMs = playback.Duration.TotalMilliseconds,
+                    DurationSource = playback.DurationSource,
+                    LyricStatus = playback.LyricStatus,
+                    UpdatedAt = DateTime.Now,
+                    Lyrics = playback.Lyrics.Select(CachedLyricLine.FromLyricLineItem).ToList()
+                };
+            }
+        }
+
+        private sealed class CachedLyricLine
+        {
+            public double StartMs { get; set; }
+            public double EndMs { get; set; }
+            public string Text { get; set; } = string.Empty;
+            public string? Translation { get; set; }
+
+            public static CachedLyricLine FromLyricLineItem(LyricLineItem line)
+            {
+                return new CachedLyricLine
+                {
+                    StartMs = line.Start.TotalMilliseconds,
+                    EndMs = line.End.TotalMilliseconds,
+                    Text = line.Text,
+                    Translation = line.Translation
+                };
+            }
+
+            public LyricLineItem ToLyricLineItem()
+            {
+                return new LyricLineItem
+                {
+                    Start = TimeSpan.FromMilliseconds(StartMs),
+                    End = TimeSpan.FromMilliseconds(EndMs),
+                    Text = Text,
+                    Translation = Translation
+                };
+            }
+        }
+
+        private sealed class ScheduledSongPlayback
+        {
+            public ScheduledSongPlayback(SongItem item, TimeSpan duration)
+            {
+                Item = item;
+                Duration = duration;
+            }
+
+            public SongItem Item { get; }
+            public TimeSpan Duration { get; set; }
+            public List<LyricLineItem> Lyrics { get; set; } = new();
+            public string DurationSource { get; set; } = "fallback";
+            public string LyricStatus { get; set; } = "loading";
+            public bool HasReliableDuration => Duration > TimeSpan.Zero && DurationSource != "unresolved";
         }
 
         private enum ComponentState

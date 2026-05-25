@@ -32,6 +32,18 @@ namespace VoiceHubComponent.Models
         /// </summary>
         [JsonPropertyName("voteCount")]
         public int VoteCount { get; set; }
+
+        [JsonPropertyName("id")]
+        public int Id { get; set; }
+
+        [JsonPropertyName("musicPlatform")]
+        public string? MusicPlatform { get; set; }
+
+        [JsonPropertyName("musicId")]
+        public string? MusicId { get; set; }
+
+        [JsonPropertyName("playUrl")]
+        public string? PlayUrl { get; set; }
     }
 
     /// <summary>
@@ -39,6 +51,9 @@ namespace VoiceHubComponent.Models
     /// </summary>
     public class SongItem
     {
+        [JsonPropertyName("id")]
+        public int Id { get; set; }
+
         /// <summary>
         /// 播放日期
         /// </summary>
@@ -56,6 +71,9 @@ namespace VoiceHubComponent.Models
         /// </summary>
         [JsonPropertyName("song")]
         public Song Song { get; set; } = new Song();
+
+        [JsonPropertyName("playTime")]
+        public PlayTimeInfo? PlayTime { get; set; }
 
         /// <summary>
         /// 获取播放日期的DateTime对象
@@ -82,6 +100,43 @@ namespace VoiceHubComponent.Models
         public DateTime GetPlayDate()
         {
             return GetPlayDateTime().Date;
+        }
+    }
+
+    public class PlayTimeInfo
+    {
+        [JsonPropertyName("id")]
+        public int Id { get; set; }
+
+        [JsonPropertyName("name")]
+        public string? Name { get; set; }
+
+        [JsonPropertyName("startTime")]
+        public string? StartTime { get; set; }
+
+        [JsonPropertyName("endTime")]
+        public string? EndTime { get; set; }
+
+        [JsonPropertyName("enabled")]
+        public bool Enabled { get; set; } = true;
+    }
+
+    public class LyricLineItem
+    {
+        public TimeSpan Start { get; set; }
+        public TimeSpan End { get; set; }
+        public string Text { get; set; } = string.Empty;
+        public string? Translation { get; set; }
+
+        public LyricLineItem Clone()
+        {
+            return new LyricLineItem
+            {
+                Start = Start,
+                End = End,
+                Text = Text,
+                Translation = Translation
+            };
         }
     }
 

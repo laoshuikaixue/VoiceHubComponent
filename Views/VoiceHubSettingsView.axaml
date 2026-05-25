@@ -30,6 +30,42 @@
                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                        Margin="16,0,0,0"/>
 
+            <fluent:SettingsExpander Header="歌词显示"
+                                     Description="按排期顺序和固定开始时间，在组件上显示当前歌词行。"
+                                     IconSource="{ci:FluentIconSource Radio}">
+                <fluent:SettingsExpander.Footer>
+                    <CheckBox x:Name="EnableLyricsCheckBox"
+                              IsChecked="{Binding EnableLyrics}"
+                              Content="启用歌词显示"
+                              VerticalAlignment="Center"/>
+                </fluent:SettingsExpander.Footer>
+            </fluent:SettingsExpander>
+
+            <fluent:SettingsExpander Header="固定开始时间"
+                                     Description="当天第一首排期歌曲开始播放的时间，支持 HH:mm 或 HH:mm:ss。"
+                                     IconSource="{ci:FluentIconSource Radio}">
+                <fluent:SettingsExpander.Footer>
+                    <TextBox x:Name="BroadcastStartTimeTextBox"
+                             Text="{Binding BroadcastStartTime}"
+                             Watermark="例如 12:20:00"
+                             Width="160"
+                             VerticalAlignment="Center"/>
+                </fluent:SettingsExpander.Footer>
+            </fluent:SettingsExpander>
+
+            <fluent:SettingsExpander Header="网易云音乐 Cookie"
+                                     Description="可选。填写后获取网易云播放地址和时长时会携带 Cookie。"
+                                     IconSource="{ci:FluentIconSource Radio}">
+                <fluent:SettingsExpander.Footer>
+                    <TextBox x:Name="NeteaseCookieTextBox"
+                             Text="{Binding NeteaseCookie}"
+                             Watermark="MUSIC_U=...; ..."
+                             PasswordChar="●"
+                             Width="300"
+                             VerticalAlignment="Center"/>
+                </fluent:SettingsExpander.Footer>
+            </fluent:SettingsExpander>
+
             <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,16,0,0">
                 <Button x:Name="SaveButton"
                         Content="保存配置"
@@ -59,6 +95,8 @@
                     <TextBlock Text="说明：" FontWeight="SemiBold"/>
                     <TextBlock Text="• 请确保API地址返回的数据格式与默认API兼容" TextWrapping="Wrap"/>
                     <TextBlock Text="• 修改设置后将在下次刷新时生效" TextWrapping="Wrap"/>
+                    <TextBlock Text="• 歌词显示需要排期歌曲包含 musicPlatform 和 musicId；网易云歌曲会优先使用 VoiceHub 同站代理获取歌词和播放时长" TextWrapping="Wrap"/>
+                    <TextBlock Text="• 网易云 Cookie 仅保存在本机设置中，用于请求 song/url/v1 获取完整歌曲信息" TextWrapping="Wrap"/>
                     <TextBlock Text="• 如果连接失败，请检查网络连接和API地址是否正确" TextWrapping="Wrap"/>
                 </StackPanel>
             </Border>
