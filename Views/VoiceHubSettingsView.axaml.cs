@@ -88,6 +88,47 @@ namespace VoiceHubComponent.Views
             }
         }
 
+        private async void ForceLyricsRefreshButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not Button button) return;
+
+            var originalContent = button.Content;
+            button.Content = "重新获取中...";
+            button.IsEnabled = false;
+
+            try
+            {
+                var apiUrl = ApiUrlTextBox.Text?.Trim();
+                if (string.IsNullOrEmpty(apiUrl))
+                {
+                    this.ShowWarningToast("请输入API地址");
+                    return;
+                }
+
+                if (!TryReadLyricsSettings(out var startTime))
+                {
+                    return;
+                }
+
+                Settings.ApiUrl = apiUrl;
+                Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
+                Settings.BroadcastStartTime = startTime;
+                Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
+                VoiceHubControl.ClearLyricCache();
+                await VoiceHubControl.RequestManualRefreshAsync();
+                this.ShowSuccessToast("歌词缓存已清除，正在重新获取");
+            }
+            catch (Exception ex)
+            {
+                this.ShowErrorToast($"重新获取失败：{ex.Message}");
+            }
+            finally
+            {
+                button.Content = originalContent;
+                button.IsEnabled = true;
+            }
+        }
+
         private async void TestConnectionButton_Click(object sender, RoutedEventArgs e)
         {
             if (sender is not Button button) return;

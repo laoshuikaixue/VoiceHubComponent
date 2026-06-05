@@ -76,6 +76,10 @@
                         Content="刷新组件"
                         Click="RefreshButton_Click"/>
 
+                <Button x:Name="ForceLyricsRefreshButton"
+                        Content="重新获取歌词"
+                        Click="ForceLyricsRefreshButton_Click"/>
+
                 <Button x:Name="TestConnectionButton"
                         Content="测试连接"
                         Click="TestConnectionButton_Click"/>

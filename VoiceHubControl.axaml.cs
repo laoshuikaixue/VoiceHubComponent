@@ -50,6 +50,7 @@ namespace VoiceHubComponent
         private static readonly Regex XmlTagRegex = new(@"<[^>]+>", RegexOptions.Compiled);
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
         private const int LyricCacheVersion = 5;
+        private const int LyricFetchRetryCount = 3;
         private static readonly TimeSpan MetadataLyricDurationTolerance = TimeSpan.FromSeconds(8);
         private static readonly TimeSpan LastResortSongDuration = TimeSpan.FromMinutes(4);
         private static readonly string CacheDirectory = Path.Combine(
@@ -151,6 +152,33 @@ namespace VoiceHubComponent
                 .Cast<Func<Task>>()
                 .Select(handler => handler());
             await Task.WhenAll(tasks);
+        }
+
+        public static void ClearLyricCache()
+        {
+            try
+            {
+                if (!Directory.Exists(CacheDirectory))
+                {
+                    return;
+                }
+
+                foreach (var file in Directory.EnumerateFiles(CacheDirectory, "lyrics-cache-*.json"))
+                {
+                    try
+                    {
+                        File.Delete(file);
+                    }
+                    catch
+                    {
+                        // 忽略单个文件删除失败，继续清理其他缓存文件。
+                    }
+                }
+            }
+            catch
+            {
+                // 缓存清理失败时不阻断后续刷新。
+            }
         }
 
         private async Task HandleManualRefreshRequestedAsync()
@@ -602,28 +630,45 @@ namespace VoiceHubComponent
                 return LyricPayload.Empty;
             }
 
-            try
+            for (var attempt = 1; attempt <= LyricFetchRetryCount; attempt++)
             {
-                LyricPayload payload;
-                if (platform == "tencent" || platform == "qq")
+                try
                 {
-                    payload = await FetchVkeysLyricsAsync("tencent", musicId, token);
-                }
-                else
-                {
-                    payload = await FetchVoiceHubNeteaseLyricsAsync(musicId, token);
-                    if (string.IsNullOrWhiteSpace(payload.Lrc))
+                    LyricPayload payload;
+                    if (platform == "tencent" || platform == "qq")
                     {
-                        payload = await FetchVkeysLyricsAsync("netease", musicId, token);
+                        payload = await FetchVkeysLyricsAsync("tencent", musicId, token);
                     }
+                    else
+                    {
+                        payload = await FetchVoiceHubNeteaseLyricsAsync(musicId, token);
+                        if (string.IsNullOrWhiteSpace(payload.Lrc) &&
+                            string.IsNullOrWhiteSpace(payload.Yrc) &&
+                            string.IsNullOrWhiteSpace(payload.Ttml))
+                        {
+                            payload = await FetchVkeysLyricsAsync("netease", musicId, token);
+                        }
+                    }
+
+                    return payload;
+                }
+                catch
+                {
+                    if (attempt == LyricFetchRetryCount)
+                    {
+                        return LyricPayload.Empty;
+                    }
+
+                    // 临时 API 失败时稍后重试。
                 }
 
-                return payload;
+                if (attempt < LyricFetchRetryCount)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(300 * attempt), token);
+                }
             }
-            catch
-            {
-                return LyricPayload.Empty;
-            }
+
+            return LyricPayload.Empty;
         }
 
         private async Task<LyricPayload> FetchVoiceHubNeteaseLyricsAsync(string musicId, CancellationToken token)
@@ -642,16 +687,21 @@ namespace VoiceHubComponent
             string? lrc = null;
             string? translation = null;
             string? yrc = null;
+            var successfulResponses = 0;
+            Exception? lastError = null;
 
             try
             {
                 using var document = JsonDocument.Parse(await lrcTask);
                 var root = document.RootElement;
+                EnsureSuccessfulApiResponse(root, "网易云歌词");
                 lrc = TryGetNestedString(root, "lrc", "lyric");
                 translation = TryGetNestedString(root, "tlyric", "lyric");
+                successfulResponses++;
             }
-            catch
+            catch (Exception ex)
             {
+                lastError = ex;
                 // 歌词接口失败时允许后续备用源兜底。
             }
 
@@ -659,11 +709,19 @@ namespace VoiceHubComponent
             {
                 using var document = JsonDocument.Parse(await yrcTask);
                 var root = document.RootElement;
+                EnsureSuccessfulApiResponse(root, "网易云逐字歌词");
                 yrc = TryGetNestedString(root, "yrc", "lyric");
+                successfulResponses++;
             }
-            catch
+            catch (Exception ex)
             {
+                lastError = ex;
                 // yrc 不是必需数据。
+            }
+
+            if (successfulResponses == 0 && lastError != null)
+            {
+                throw new HttpRequestException("网易云歌词接口请求失败", lastError);
             }
 
             return new LyricPayload(lrc, translation, yrc, null);
@@ -675,10 +733,11 @@ namespace VoiceHubComponent
             var json = await _httpClient.GetStringAsync(lyricUrl, token);
             using var document = JsonDocument.Parse(json);
             var root = document.RootElement;
+            EnsureSuccessfulApiResponse(root, "VKeys 歌词");
 
             if (!root.TryGetProperty("data", out var data))
             {
-                return LyricPayload.Empty;
+                throw new HttpRequestException("VKeys 歌词接口返回无效数据");
             }
 
             var lrc = TryGetString(data, "lrc");
@@ -775,7 +834,6 @@ namespace VoiceHubComponent
 
             foreach (var fetcher in new Func<string, CancellationToken, Task<DurationProbe>>[]
                      {
-                         FetchNextMusicDurationAsync,
                          FetchRrvennDurationAsync,
                          FetchVkeysNeteaseDurationAsync,
                          FetchMetingDurationAsync
@@ -798,45 +856,16 @@ namespace VoiceHubComponent
             return DurationProbe.Empty;
         }
 
-        private async Task<DurationProbe> FetchNextMusicDurationAsync(string musicId, CancellationToken token)
-        {
-            using var request = new HttpRequestMessage(HttpMethod.Post, "https://nextmusic.toubiec.cn/api/getSongUrl");
-            AddNextMusicHeaders(request);
-            var body = JsonSerializer.Serialize(new
-            {
-                id = musicId,
-                level = "exhigh",
-                token = GetNextMusicToken()
-            });
-            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
-
-            using var response = await _httpClient.SendAsync(request, token);
-            response.EnsureSuccessStatusCode();
-            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
-            if (!document.RootElement.TryGetProperty("data", out var data))
-            {
-                return DurationProbe.Empty;
-            }
-
-            return await ResolveAudioDataDurationAsync(data, "nextmusic-audio", token);
-        }
-
         private async Task<DurationProbe> FetchRrvennDurationAsync(string musicId, CancellationToken token)
         {
-            var timestamp = DateTimeOffset.Now.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
-            using var content = new FormUrlEncodedContent(new Dictionary<string, string>
+            var url = $"https://music.rrvenn.cn/api/song?url={Uri.EscapeDataString(musicId)}&level=exhigh";
+            var json = await _httpClient.GetStringAsync(url, token);
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.TryGetProperty("data", out var data))
             {
-                ["action"] = "music",
-                ["url"] = musicId,
-                ["level"] = "exhigh",
-                ["type"] = "json",
-                ["timestamp"] = timestamp,
-                ["signature"] = ComputeMd5Hex(timestamp + "kxz_163music_secret_key_2024")
-            });
+                return await ResolveAudioDataDurationAsync(data, "rrvenn-audio", token);
+            }
 
-            using var response = await _httpClient.PostAsync("https://music.rrvenn.cn/api/api.php", content, token);
-            response.EnsureSuccessStatusCode();
-            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
             return await ResolveAudioDataDurationAsync(document.RootElement, "rrvenn-audio", token);
         }
 
@@ -1017,6 +1046,26 @@ namespace VoiceHubComponent
             };
         }
 
+        private static void EnsureSuccessfulApiResponse(JsonElement root, string sourceName)
+        {
+            if (!root.TryGetProperty("code", out var code))
+            {
+                return;
+            }
+
+            var isSuccessful = code.ValueKind switch
+            {
+                JsonValueKind.Number when code.TryGetInt32(out var number) => number == 200,
+                JsonValueKind.String => string.Equals(code.GetString(), "200", StringComparison.OrdinalIgnoreCase),
+                _ => false
+            };
+
+            if (!isSuccessful)
+            {
+                throw new HttpRequestException($"{sourceName}接口返回异常状态：{code}");
+            }
+        }
+
         private static TimeSpan TryReadDuration(JsonElement element)
         {
             var timeMs = TryGetNumber(element, "time");
@@ -1055,19 +1104,6 @@ namespace VoiceHubComponent
                 MetadataLyricDurationTolerance.TotalMilliseconds,
                 lyricDuration.TotalMilliseconds * 0.15));
             return duration + tolerance >= lyricDuration;
-        }
-
-        private static void AddNextMusicHeaders(HttpRequestMessage request)
-        {
-            request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-            request.Headers.TryAddWithoutValidation("Origin", "https://nextmusic.toubiec.cn");
-            request.Headers.TryAddWithoutValidation("Referer", "https://nextmusic.toubiec.cn/");
-        }
-
-        private static string GetNextMusicToken()
-        {
-            var currentMinute = DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 60;
-            return ComputeMd5Hex($"suxiaoqings:{currentMinute}");
         }
 
         private static string ComputeMd5Hex(string value)
