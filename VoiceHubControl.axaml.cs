@@ -165,7 +165,14 @@ namespace VoiceHubComponent
 
                 foreach (var file in Directory.EnumerateFiles(CacheDirectory, "lyrics-cache-*.json"))
                 {
-                    File.Delete(file);
+                    try
+                    {
+                        File.Delete(file);
+                    }
+                    catch
+                    {
+                        // 忽略单个文件删除失败，继续清理其他缓存文件。
+                    }
                 }
             }
             catch
@@ -643,10 +650,7 @@ namespace VoiceHubComponent
                         }
                     }
 
-                    if (HasAnyLyric(payload) || attempt == LyricFetchRetryCount)
-                    {
-                        return payload;
-                    }
+                    return payload;
                 }
                 catch
                 {
@@ -683,16 +687,21 @@ namespace VoiceHubComponent
             string? lrc = null;
             string? translation = null;
             string? yrc = null;
+            var successfulResponses = 0;
+            Exception? lastError = null;
 
             try
             {
                 using var document = JsonDocument.Parse(await lrcTask);
                 var root = document.RootElement;
+                EnsureSuccessfulApiResponse(root, "网易云歌词");
                 lrc = TryGetNestedString(root, "lrc", "lyric");
                 translation = TryGetNestedString(root, "tlyric", "lyric");
+                successfulResponses++;
             }
-            catch
+            catch (Exception ex)
             {
+                lastError = ex;
                 // 歌词接口失败时允许后续备用源兜底。
             }
 
@@ -700,11 +709,19 @@ namespace VoiceHubComponent
             {
                 using var document = JsonDocument.Parse(await yrcTask);
                 var root = document.RootElement;
+                EnsureSuccessfulApiResponse(root, "网易云逐字歌词");
                 yrc = TryGetNestedString(root, "yrc", "lyric");
+                successfulResponses++;
             }
-            catch
+            catch (Exception ex)
             {
+                lastError = ex;
                 // yrc 不是必需数据。
+            }
+
+            if (successfulResponses == 0 && lastError != null)
+            {
+                throw new HttpRequestException("网易云歌词接口请求失败", lastError);
             }
 
             return new LyricPayload(lrc, translation, yrc, null);
@@ -716,10 +733,11 @@ namespace VoiceHubComponent
             var json = await _httpClient.GetStringAsync(lyricUrl, token);
             using var document = JsonDocument.Parse(json);
             var root = document.RootElement;
+            EnsureSuccessfulApiResponse(root, "VKeys 歌词");
 
             if (!root.TryGetProperty("data", out var data))
             {
-                return LyricPayload.Empty;
+                throw new HttpRequestException("VKeys 歌词接口返回无效数据");
             }
 
             var lrc = TryGetString(data, "lrc");
@@ -1026,6 +1044,26 @@ namespace VoiceHubComponent
                 JsonValueKind.String when double.TryParse(value.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var number) => number,
                 _ => 0
             };
+        }
+
+        private static void EnsureSuccessfulApiResponse(JsonElement root, string sourceName)
+        {
+            if (!root.TryGetProperty("code", out var code))
+            {
+                return;
+            }
+
+            var isSuccessful = code.ValueKind switch
+            {
+                JsonValueKind.Number when code.TryGetInt32(out var number) => number == 200,
+                JsonValueKind.String => string.Equals(code.GetString(), "200", StringComparison.OrdinalIgnoreCase),
+                _ => false
+            };
+
+            if (!isSuccessful)
+            {
+                throw new HttpRequestException($"{sourceName}接口返回异常状态：{code}");
+            }
         }
 
         private static TimeSpan TryReadDuration(JsonElement element)
@@ -1743,13 +1781,6 @@ namespace VoiceHubComponent
         private sealed record LyricPayload(string? Lrc, string? Translation, string? Yrc, string? Ttml)
         {
             public static LyricPayload Empty { get; } = new(null, null, null, null);
-        }
-
-        private static bool HasAnyLyric(LyricPayload payload)
-        {
-            return !string.IsNullOrWhiteSpace(payload.Lrc) ||
-                   !string.IsNullOrWhiteSpace(payload.Yrc) ||
-                   !string.IsNullOrWhiteSpace(payload.Ttml);
         }
 
         private sealed record ResolvedPlayback(
