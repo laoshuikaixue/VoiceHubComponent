@@ -18,6 +18,8 @@ using Avalonia.Media;
 using Avalonia.VisualTree;
 using ClassIsland.Core.Abstractions.Controls;
 using ClassIsland.Core.Attributes;
+using ClassIsland.Shared;
+using Microsoft.Extensions.Logging;
 using VoiceHubComponent.Models;
 
 namespace VoiceHubComponent
@@ -33,6 +35,7 @@ namespace VoiceHubComponent
         private static event Func<Task>? ManualRefreshRequested;
         private readonly HttpClient _httpClient = new HttpClient();
         private readonly SemaphoreSlim _refreshLock = new(1, 1);
+        private readonly ILogger<VoiceHubControl>? _logger = IAppHost.TryGetService<ILogger<VoiceHubControl>>();
         private ComponentState _currentState = ComponentState.Loading;
         private readonly DispatcherTimer _refreshTimer;
         private readonly DispatcherTimer _lyricTimer;
@@ -48,9 +51,12 @@ namespace VoiceHubComponent
         private static readonly Regex TtmlLineRegex = new(@"<(?:p|span)[^>]*?begin=""([^""]+)""[^>]*?(?:end=""([^""]+)""|dur=""([^""]+)"")?[^>]*>(.*?)</(?:p|span)>", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
         private static readonly Regex LrcMetaRegex = new(@"^\[[a-z]+:", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex XmlTagRegex = new(@"<[^>]+>", RegexOptions.Compiled);
+        private static readonly Regex TencentLegacyIdRegex = new(@"^\d+$", RegexOptions.Compiled);
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
-        private const int LyricCacheVersion = 5;
+        private const int LyricCacheVersion = 6;
         private const int LyricFetchRetryCount = 3;
+        private const int MinValidTencentAudioDurationSeconds = 10;
+        private const string InvalidTencentAudioUrlSuffix = "/2149972737147268278.mp3";
         private static readonly TimeSpan MetadataLyricDurationTolerance = TimeSpan.FromSeconds(8);
         private static readonly TimeSpan LastResortSongDuration = TimeSpan.FromMinutes(4);
         private static readonly string CacheDirectory = Path.Combine(
@@ -398,6 +404,39 @@ namespace VoiceHubComponent
             return string.IsNullOrWhiteSpace(value) ? "netease" : value;
         }
 
+        private static string NormalizeTencentMusicId(string musicId)
+        {
+            return musicId.Trim().StartsWith("qqmid:", StringComparison.OrdinalIgnoreCase)
+                ? musicId.Trim()[6..]
+                : musicId.Trim();
+        }
+
+        private static bool IsTencentLegacyNumericId(string musicId)
+        {
+            return TencentLegacyIdRegex.IsMatch(NormalizeTencentMusicId(musicId));
+        }
+
+        private static (string Key, string Value) GetVkeysIdParam(string platform, string musicId)
+        {
+            if (platform == "tencent")
+            {
+                var normalized = NormalizeTencentMusicId(musicId);
+                return IsTencentLegacyNumericId(normalized)
+                    ? ("id", normalized)
+                    : ("mid", normalized);
+            }
+
+            return ("id", musicId.Trim());
+        }
+
+        private static (string Key, string Value) GetTencentNativeLyricIdParam(string musicId)
+        {
+            var normalized = NormalizeTencentMusicId(musicId);
+            return IsTencentLegacyNumericId(normalized)
+                ? ("songid", normalized)
+                : ("songmid", normalized);
+        }
+
         private static DailyLyricCache LoadDailyCache(DateTime date, string scheduleSignature, string cookieFingerprint)
         {
             try
@@ -549,6 +588,12 @@ namespace VoiceHubComponent
                         cache.Entries.TryGetValue(cacheKey, out var cachedEntry) &&
                         cachedEntry.IsUsable())
                     {
+                        _logger?.LogInformation(
+                            "VoiceHub 歌词缓存命中：{CacheKey}, status={LyricStatus}, lines={LineCount}, durationSource={DurationSource}",
+                            cacheKey,
+                            cachedEntry.LyricStatus,
+                            cachedEntry.Lyrics.Count,
+                            cachedEntry.DurationSource);
                         foreach (var entry in group)
                         {
                             ApplyCacheEntry(entry, cachedEntry);
@@ -569,6 +614,15 @@ namespace VoiceHubComponent
                     {
                         cache.Entries[cacheKey] = CacheEntry.FromPlayback(cacheKey, firstEntry);
                     }
+
+                    _logger?.LogInformation(
+                        "VoiceHub 歌曲解析完成：{Platform}:{MusicId}, status={LyricStatus}, lines={LineCount}, duration={Duration}, durationSource={DurationSource}",
+                        NormalizePlatform(firstEntry.Item.Song.MusicPlatform),
+                        firstEntry.Item.Song.MusicId ?? firstEntry.Item.Song.Id.ToString(CultureInfo.InvariantCulture),
+                        resolved.LyricStatus,
+                        resolved.Lyrics.Count,
+                        resolved.Duration,
+                        resolved.DurationSource);
                 }
             }
 
@@ -589,6 +643,12 @@ namespace VoiceHubComponent
         {
             var payload = await FetchLyricsAsync(song, token);
             var lyrics = ParseBestLyrics(payload);
+            _logger?.LogInformation(
+                "VoiceHub 歌词解析行数：{Platform}:{MusicId}, lines={LineCount}, hasTranslation={HasTranslation}",
+                NormalizePlatform(song.MusicPlatform),
+                song.MusicId ?? song.Id.ToString(CultureInfo.InvariantCulture),
+                lyrics.Count,
+                !string.IsNullOrWhiteSpace(payload.Translation));
             if (!string.IsNullOrWhiteSpace(payload.Translation))
             {
                 AlignTranslations(lyrics, ParseSmartLrc(payload.Translation));
@@ -609,7 +669,7 @@ namespace VoiceHubComponent
                     return new ResolvedPlayback(fallbackAudioDuration.Duration, fallbackAudioDuration.Source, lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
                 }
 
-                return new ResolvedPlayback(TimeSpan.Zero, "unresolved", lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+                return BuildEstimatedPlayback(lyricDuration, lyrics);
             }
 
             var audioDuration = await FetchFallbackAudioDurationAsync(song, lyricDuration, token);
@@ -618,7 +678,13 @@ namespace VoiceHubComponent
                 return new ResolvedPlayback(audioDuration.Duration, audioDuration.Source, lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
             }
 
-            return new ResolvedPlayback(TimeSpan.Zero, "unresolved", lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+            return BuildEstimatedPlayback(lyricDuration, lyrics);
+        }
+
+        private static ResolvedPlayback BuildEstimatedPlayback(TimeSpan lyricDuration, List<LyricLineItem> lyrics)
+        {
+            var duration = lyricDuration > TimeSpan.Zero ? lyricDuration : LastResortSongDuration;
+            return new ResolvedPlayback(duration, "fallback", lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
         }
 
         private async Task<LyricPayload> FetchLyricsAsync(Song song, CancellationToken token)
@@ -637,11 +703,41 @@ namespace VoiceHubComponent
                     LyricPayload payload;
                     if (platform == "tencent" || platform == "qq")
                     {
-                        payload = await FetchVkeysLyricsAsync("tencent", musicId, token);
+                        try
+                        {
+                            payload = await FetchVoiceHubTencentLyricsAsync(musicId, token);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger?.LogWarning(
+                                ex,
+                                "VoiceHub QQ 原生歌词接口失败，将回退 VKeys：musicId={MusicId}",
+                                musicId);
+                            payload = LyricPayload.Empty;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(payload.Lrc) &&
+                            string.IsNullOrWhiteSpace(payload.Yrc) &&
+                            string.IsNullOrWhiteSpace(payload.Ttml))
+                        {
+                            payload = await FetchVkeysLyricsAsync("tencent", musicId, token);
+                        }
                     }
                     else
                     {
-                        payload = await FetchVoiceHubNeteaseLyricsAsync(musicId, token);
+                        try
+                        {
+                            payload = await FetchVoiceHubNeteaseLyricsAsync(musicId, token);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger?.LogWarning(
+                                ex,
+                                "VoiceHub 网易云歌词接口失败，将回退 VKeys：musicId={MusicId}",
+                                musicId);
+                            payload = LyricPayload.Empty;
+                        }
+
                         if (string.IsNullOrWhiteSpace(payload.Lrc) &&
                             string.IsNullOrWhiteSpace(payload.Yrc) &&
                             string.IsNullOrWhiteSpace(payload.Ttml))
@@ -652,13 +748,25 @@ namespace VoiceHubComponent
 
                     return payload;
                 }
-                catch
+                catch (Exception ex)
                 {
                     if (attempt == LyricFetchRetryCount)
                     {
+                        _logger?.LogWarning(
+                            ex,
+                            "VoiceHub 歌词获取最终失败：platform={Platform}, musicId={MusicId}, attempt={Attempt}",
+                            platform,
+                            musicId,
+                            attempt);
                         return LyricPayload.Empty;
                     }
 
+                    _logger?.LogWarning(
+                        ex,
+                        "VoiceHub 歌词获取失败，准备重试：platform={Platform}, musicId={MusicId}, attempt={Attempt}",
+                        platform,
+                        musicId,
+                        attempt);
                     // 临时 API 失败时稍后重试。
                 }
 
@@ -681,8 +789,8 @@ namespace VoiceHubComponent
 
             var lyricUrl = new Uri(origin, $"/api/api-enhanced/netease/lyric?id={Uri.EscapeDataString(musicId)}");
             var lyricNewUrl = new Uri(origin, $"/api/api-enhanced/netease/lyric/new?id={Uri.EscapeDataString(musicId)}");
-            var lrcTask = _httpClient.GetStringAsync(lyricUrl, token);
-            var yrcTask = _httpClient.GetStringAsync(lyricNewUrl, token);
+            var lrcTask = GetVoiceHubStringAsync(lyricUrl, token);
+            var yrcTask = GetVoiceHubStringAsync(lyricNewUrl, token);
 
             string? lrc = null;
             string? translation = null;
@@ -702,6 +810,7 @@ namespace VoiceHubComponent
             catch (Exception ex)
             {
                 lastError = ex;
+                _logger?.LogWarning(ex, "VoiceHub 网易云 LRC 歌词接口失败：musicId={MusicId}", musicId);
                 // 歌词接口失败时允许后续备用源兜底。
             }
 
@@ -716,6 +825,7 @@ namespace VoiceHubComponent
             catch (Exception ex)
             {
                 lastError = ex;
+                _logger?.LogWarning(ex, "VoiceHub 网易云 YRC 歌词接口失败：musicId={MusicId}", musicId);
                 // yrc 不是必需数据。
             }
 
@@ -727,9 +837,54 @@ namespace VoiceHubComponent
             return new LyricPayload(lrc, translation, yrc, null);
         }
 
+        private async Task<LyricPayload> FetchVoiceHubTencentLyricsAsync(string musicId, CancellationToken token)
+        {
+            var origin = GetVoiceHubOrigin();
+            if (origin == null)
+            {
+                return LyricPayload.Empty;
+            }
+
+            var idParam = GetTencentNativeLyricIdParam(musicId);
+            _logger?.LogInformation(
+                "VoiceHub QQ 原生歌词请求：{IdKey}={IdValue}",
+                idParam.Key,
+                idParam.Value);
+            var lyricUrl = new Uri(origin, $"/api/native-api/lyric/tx?{idParam.Key}={Uri.EscapeDataString(idParam.Value)}");
+            var json = await GetVoiceHubStringAsync(lyricUrl, token);
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            if (root.TryGetProperty("success", out var success) &&
+                success.ValueKind == JsonValueKind.False)
+            {
+                throw new HttpRequestException("VoiceHub QQ 歌词接口返回失败");
+            }
+
+            if (!root.TryGetProperty("data", out var data))
+            {
+                throw new HttpRequestException("VoiceHub QQ 歌词接口返回无效数据");
+            }
+
+            var lrc = TryGetString(data, "lrc");
+            var translation = TryGetString(data, "trans");
+            _logger?.LogInformation(
+                "VoiceHub QQ 原生歌词响应：{IdKey}={IdValue}, hasLrc={HasLrc}, hasTranslation={HasTranslation}",
+                idParam.Key,
+                idParam.Value,
+                !string.IsNullOrWhiteSpace(lrc),
+                !string.IsNullOrWhiteSpace(translation));
+            return new LyricPayload(lrc, translation, null, null);
+        }
+
         private async Task<LyricPayload> FetchVkeysLyricsAsync(string platform, string musicId, CancellationToken token)
         {
-            var lyricUrl = $"https://api.vkeys.cn/v2/music/{platform}/lyric?id={Uri.EscapeDataString(musicId)}";
+            var idParam = GetVkeysIdParam(platform, musicId);
+            _logger?.LogInformation(
+                "VoiceHub VKeys 歌词请求：platform={Platform}, {IdKey}={IdValue}",
+                platform,
+                idParam.Key,
+                idParam.Value);
+            var lyricUrl = $"https://api.vkeys.cn/v2/music/{platform}/lyric?{idParam.Key}={Uri.EscapeDataString(idParam.Value)}";
             var json = await _httpClient.GetStringAsync(lyricUrl, token);
             using var document = JsonDocument.Parse(json);
             var root = document.RootElement;
@@ -744,6 +899,15 @@ namespace VoiceHubComponent
             var translation = TryGetString(data, "trans");
             var yrc = TryGetString(data, "yrc");
             var ttml = TryGetString(data, "ttml");
+            _logger?.LogInformation(
+                "VoiceHub VKeys 歌词响应：platform={Platform}, {IdKey}={IdValue}, hasLrc={HasLrc}, hasTrans={HasTrans}, hasYrc={HasYrc}, hasTtml={HasTtml}",
+                platform,
+                idParam.Key,
+                idParam.Value,
+                !string.IsNullOrWhiteSpace(lrc),
+                !string.IsNullOrWhiteSpace(translation),
+                !string.IsNullOrWhiteSpace(yrc),
+                !string.IsNullOrWhiteSpace(ttml));
             return new LyricPayload(lrc, translation, yrc, ttml);
         }
 
@@ -763,8 +927,13 @@ namespace VoiceHubComponent
                     : await FetchNeteaseDurationAsync(musicId, token);
                 return duration;
             }
-            catch
+            catch (Exception ex)
             {
+                _logger?.LogWarning(
+                    ex,
+                    "VoiceHub 官方时长获取失败：platform={Platform}, musicId={MusicId}",
+                    platform,
+                    musicId);
                 return DurationProbe.Empty;
             }
         }
@@ -785,8 +954,9 @@ namespace VoiceHubComponent
                     return urlDuration;
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                _logger?.LogWarning(ex, "VoiceHub 网易云 URL 时长接口失败，尝试详情接口：musicId={MusicId}", musicId);
                 // URL 接口失败时继续尝试详情接口。
             }
 
@@ -801,7 +971,7 @@ namespace VoiceHubComponent
                 ? "&unblock=true"
                 : $"&unblock=false&cookie={Uri.EscapeDataString(cookie)}";
             var url = new Uri(origin, query);
-            var json = await _httpClient.GetStringAsync(url, token);
+            var json = await GetVoiceHubStringAsync(url, token);
             using var document = JsonDocument.Parse(json);
             if (!document.RootElement.TryGetProperty("data", out var dataElement) ||
                 dataElement.ValueKind != JsonValueKind.Array ||
@@ -827,9 +997,14 @@ namespace VoiceHubComponent
         {
             var platform = song.MusicPlatform?.Trim().ToLowerInvariant();
             var musicId = string.IsNullOrWhiteSpace(song.MusicId) ? song.Id.ToString(CultureInfo.InvariantCulture) : song.MusicId.Trim();
-            if (string.IsNullOrWhiteSpace(musicId) || platform is "tencent" or "qq")
+            if (string.IsNullOrWhiteSpace(musicId))
             {
                 return DurationProbe.Empty;
+            }
+
+            if (platform is "tencent" or "qq")
+            {
+                return await FetchVoiceHubResolvedAudioDurationAsync(song, lyricDuration, token);
             }
 
             foreach (var fetcher in new Func<string, CancellationToken, Task<DurationProbe>>[]
@@ -847,13 +1022,95 @@ namespace VoiceHubComponent
                         return duration;
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    _logger?.LogWarning(
+                        ex,
+                        "VoiceHub 备用音源时长获取失败：source={Source}, musicId={MusicId}",
+                        fetcher.Method.Name,
+                        musicId);
                     // 单个备用音源失败时继续尝试下一个。
                 }
             }
 
             return DurationProbe.Empty;
+        }
+
+        private async Task<DurationProbe> FetchVoiceHubResolvedAudioDurationAsync(Song song, TimeSpan lyricDuration, CancellationToken token)
+        {
+            var origin = GetVoiceHubOrigin();
+            if (origin == null)
+            {
+                return DurationProbe.Empty;
+            }
+
+            var musicId = string.IsNullOrWhiteSpace(song.MusicId)
+                ? song.Id.ToString(CultureInfo.InvariantCulture)
+                : song.MusicId.Trim();
+            var payload = new
+            {
+                platform = "tencent",
+                musicId,
+                playUrl = string.IsNullOrWhiteSpace(song.PlayUrl) ? null : song.PlayUrl.Trim(),
+                quality = 8
+            };
+
+            var jsonPayload = JsonSerializer.Serialize(payload);
+            using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(origin, "/api/music/resolve-url"))
+            {
+                Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
+            };
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger?.LogWarning(
+                    "VoiceHub QQ resolve-url 返回非成功状态：status={StatusCode}, musicId={MusicId}",
+                    response.StatusCode,
+                    musicId);
+                return DurationProbe.Empty;
+            }
+
+            await using var responseStream = await response.Content.ReadAsStreamAsync(token);
+            using var document = await JsonDocument.ParseAsync(responseStream, cancellationToken: token);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("success", out var success) ||
+                success.ValueKind != JsonValueKind.True)
+            {
+                _logger?.LogWarning("VoiceHub QQ resolve-url 响应 success=false：musicId={MusicId}", musicId);
+                return DurationProbe.Empty;
+            }
+
+            var audioUrl = TryGetString(root, "url");
+            if (string.IsNullOrWhiteSpace(audioUrl))
+            {
+                _logger?.LogWarning("VoiceHub QQ resolve-url 未返回音频 URL：musicId={MusicId}", musicId);
+                return DurationProbe.Empty;
+            }
+
+            if (IsKnownInvalidTencentAudioUrl(audioUrl))
+            {
+                _logger?.LogWarning("VoiceHub QQ 解析到已知无效音频链接：{AudioUrl}", audioUrl);
+                return DurationProbe.Empty;
+            }
+
+            var estimatedDuration = await EstimateAudioDurationFromUrlAsync(audioUrl, 0, token);
+            _logger?.LogInformation(
+                "VoiceHub QQ resolve-url 音频时长估算完成：musicId={MusicId}, duration={Duration}",
+                musicId,
+                estimatedDuration);
+            if (IsInvalidTencentAudioDuration(estimatedDuration, lyricDuration))
+            {
+                _logger?.LogWarning(
+                    "VoiceHub QQ 音频时长过短，忽略该解析结果：duration={Duration}, lyricDuration={LyricDuration}, url={AudioUrl}",
+                    estimatedDuration,
+                    lyricDuration,
+                    audioUrl);
+                return DurationProbe.Empty;
+            }
+
+            return IsDurationTrusted(estimatedDuration, lyricDuration)
+                ? new DurationProbe(estimatedDuration, "voicehub-audio")
+                : DurationProbe.Empty;
         }
 
         private async Task<DurationProbe> FetchRrvennDurationAsync(string musicId, CancellationToken token)
@@ -900,8 +1157,9 @@ namespace VoiceHubComponent
                         return duration;
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    _logger?.LogWarning(ex, "VoiceHub Meting 时长源失败：baseUrl={BaseUrl}, musicId={MusicId}", baseUrl, musicId);
                     // 继续尝试下一个 Meting 源。
                 }
             }
@@ -956,8 +1214,9 @@ namespace VoiceHubComponent
                     ? TimeSpan.FromSeconds(contentLength * 8d / trustedBitrate)
                     : TimeSpan.Zero;
             }
-            catch
+            catch (Exception ex)
             {
+                _logger?.LogWarning(ex, "VoiceHub 音频时长估算失败：url={AudioUrl}", audioUrl);
                 return TimeSpan.Zero;
             }
         }
@@ -965,7 +1224,7 @@ namespace VoiceHubComponent
         private async Task<DurationProbe> FetchNeteaseDetailDurationAsync(Uri origin, string musicId, CancellationToken token)
         {
             var detailUrl = new Uri(origin, $"/api/api-enhanced/netease/song/detail?ids={Uri.EscapeDataString(musicId)}");
-            var json = await _httpClient.GetStringAsync(detailUrl, token);
+            var json = await GetVoiceHubStringAsync(detailUrl, token);
             using var document = JsonDocument.Parse(json);
             if (!document.RootElement.TryGetProperty("songs", out var songsElement) ||
                 songsElement.ValueKind != JsonValueKind.Array ||
@@ -983,7 +1242,8 @@ namespace VoiceHubComponent
 
         private async Task<DurationProbe> FetchTencentDurationAsync(string musicId, CancellationToken token)
         {
-            var detailUrl = $"https://api.vkeys.cn/v2/music/tencent?id={Uri.EscapeDataString(musicId)}";
+            var idParam = GetVkeysIdParam("tencent", musicId);
+            var detailUrl = $"https://api.vkeys.cn/v2/music/tencent?{idParam.Key}={Uri.EscapeDataString(idParam.Value)}";
             var json = await _httpClient.GetStringAsync(detailUrl, token);
             using var document = JsonDocument.Parse(json);
             if (!document.RootElement.TryGetProperty("data", out var data))
@@ -1004,6 +1264,11 @@ namespace VoiceHubComponent
 
             // Vkeys QQ 音乐通常返回秒；异常偏大的值按毫秒处理。
             var durationValue = duration > 10_000 ? TimeSpan.FromMilliseconds(duration) : TimeSpan.FromSeconds(duration);
+            _logger?.LogInformation(
+                "VoiceHub QQ VKeys 时长响应：{IdKey}={IdValue}, duration={Duration}",
+                idParam.Key,
+                idParam.Value,
+                durationValue);
             return new DurationProbe(durationValue, "metadata");
         }
 
@@ -1015,6 +1280,44 @@ namespace VoiceHubComponent
             }
 
             return new Uri(apiUri.GetLeftPart(UriPartial.Authority));
+        }
+
+        private async Task<string> GetVoiceHubStringAsync(Uri url, CancellationToken token)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            AddVoiceHubSameOriginHeaders(request, url);
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+            var content = await response.Content.ReadAsStringAsync(token);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger?.LogWarning(
+                    "VoiceHub 内部接口返回非成功状态：status={StatusCode}, path={Path}, body={Body}",
+                    response.StatusCode,
+                    url.AbsolutePath,
+                    TruncateForLog(content, 500));
+                throw new HttpRequestException(
+                    $"VoiceHub 内部接口返回非成功状态：{(int)response.StatusCode} {response.StatusCode}");
+            }
+
+            return content;
+        }
+
+        private static void AddVoiceHubSameOriginHeaders(HttpRequestMessage request, Uri url)
+        {
+            var origin = url.GetLeftPart(UriPartial.Authority);
+            request.Headers.Referrer = new Uri(origin + "/");
+            request.Headers.TryAddWithoutValidation("Origin", origin);
+            request.Headers.TryAddWithoutValidation("X-Requested-From", "ClassIslandPlugin");
+        }
+
+        private static string TruncateForLog(string? value, int maxLength)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return string.Empty;
+            }
+
+            return value.Length <= maxLength ? value : value[..maxLength] + "...";
         }
 
         private static string? TryGetNestedString(JsonElement root, string objectName, string propertyName)
@@ -1088,6 +1391,25 @@ namespace VoiceHubComponent
             return duration > 10_000 ? TimeSpan.FromMilliseconds(duration) : TimeSpan.FromSeconds(duration);
         }
 
+        private static bool IsKnownInvalidTencentAudioUrl(string? url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return false;
+            }
+
+            var normalized = url.Trim().Replace("http://", "https://", StringComparison.OrdinalIgnoreCase);
+            var urlWithoutParams = normalized.Split('?', '#')[0];
+            return urlWithoutParams.EndsWith(InvalidTencentAudioUrlSuffix, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsInvalidTencentAudioDuration(TimeSpan duration, TimeSpan expectedDuration)
+        {
+            return expectedDuration >= TimeSpan.FromSeconds(MinValidTencentAudioDurationSeconds) &&
+                   duration > TimeSpan.Zero &&
+                   duration < TimeSpan.FromSeconds(MinValidTencentAudioDurationSeconds);
+        }
+
         private static bool IsDurationTrusted(TimeSpan duration, TimeSpan lyricDuration)
         {
             if (duration <= TimeSpan.Zero)
@@ -1128,8 +1450,9 @@ namespace VoiceHubComponent
                     return contentLength;
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                _logger?.LogDebug(ex, "VoiceHub 音频 HEAD 长度探测失败，尝试 Range：url={AudioUrl}", audioUrl);
                 // 有些音源不支持 HEAD，继续尝试 Range 请求。
             }
 
@@ -1142,8 +1465,9 @@ namespace VoiceHubComponent
                        ?? response.Content.Headers.ContentLength
                        ?? 0;
             }
-            catch
+            catch (Exception ex)
             {
+                _logger?.LogDebug(ex, "VoiceHub 音频 Range 长度探测失败：url={AudioUrl}", audioUrl);
                 return 0;
             }
         }
@@ -1158,8 +1482,9 @@ namespace VoiceHubComponent
                 var bytes = await response.Content.ReadAsByteArrayAsync(token);
                 return TryReadMp3Bitrate(bytes);
             }
-            catch
+            catch (Exception ex)
             {
+                _logger?.LogDebug(ex, "VoiceHub MP3 比特率探测失败：url={AudioUrl}", audioUrl);
                 return 0;
             }
         }
@@ -1660,7 +1985,7 @@ namespace VoiceHubComponent
             {
                 if (!entry.HasReliableDuration)
                 {
-                    return string.Empty;
+                    return _scheduleSummaryText;
                 }
 
                 var start = cursor;
@@ -1673,7 +1998,7 @@ namespace VoiceHubComponent
                 cursor = end;
             }
 
-            return $"今日排期已播放完毕 | {_scheduleSummaryText}";
+            return _scheduleSummaryText;
         }
 
         private TimeSpan ResolveBroadcastStartTime(IReadOnlyList<ScheduledSongPlayback> plan)
@@ -1817,7 +2142,7 @@ namespace VoiceHubComponent
 
             public bool IsUsable()
             {
-                return DurationMs > 0;
+                return DurationMs > 0 && Lyrics.Count > 0 && !string.Equals(LyricStatus, "no-lyrics", StringComparison.OrdinalIgnoreCase);
             }
 
             public static CacheEntry FromPlayback(string cacheKey, ScheduledSongPlayback playback)
