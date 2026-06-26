@@ -15,6 +15,8 @@ namespace VoiceHubComponent.Models
         private bool _enableLyrics = false;
         private string _broadcastStartTime = "12:20:00";
         private string _neteaseCookie = string.Empty;
+        private bool _useDebugScheduleDate = false;
+        private DateTime _debugScheduleDate = DateTime.Today;
         private bool _isLoaded = false;
         private static readonly string SettingsPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -110,6 +112,51 @@ namespace VoiceHubComponent.Models
             }
         }
 
+        /// <summary>
+        /// 是否使用调试排期日期。
+        /// </summary>
+        public bool UseDebugScheduleDate
+        {
+            get
+            {
+                EnsureLoaded();
+                return _useDebugScheduleDate;
+            }
+            set
+            {
+                EnsureLoaded();
+                if (_useDebugScheduleDate != value)
+                {
+                    _useDebugScheduleDate = value;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 调试排期日期。
+        /// </summary>
+        public DateTime DebugScheduleDate
+        {
+            get
+            {
+                EnsureLoaded();
+                return _debugScheduleDate;
+            }
+            set
+            {
+                EnsureLoaded();
+                var normalized = value.Date;
+                if (_debugScheduleDate != normalized)
+                {
+                    _debugScheduleDate = normalized;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
         public event PropertyChangedEventHandler? PropertyChanged;
 
         public VoiceHubSettings()
@@ -166,6 +213,20 @@ namespace VoiceHubComponent.Models
                     if (jsonDocument.RootElement.TryGetProperty("NeteaseCookie", out var cookieElement))
                     {
                         _neteaseCookie = cookieElement.GetString()?.Trim() ?? string.Empty;
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("UseDebugScheduleDate", out var useDebugScheduleDateElement))
+                    {
+                        _useDebugScheduleDate = useDebugScheduleDateElement.GetBoolean();
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("DebugScheduleDate", out var debugScheduleDateElement))
+                    {
+                        if (debugScheduleDateElement.ValueKind == JsonValueKind.String &&
+                            DateTime.TryParse(debugScheduleDateElement.GetString(), out var debugScheduleDate))
+                        {
+                            _debugScheduleDate = debugScheduleDate.Date;
+                        }
                     }
                 }
             }

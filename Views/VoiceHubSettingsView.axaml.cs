@@ -45,6 +45,8 @@ namespace VoiceHubComponent.Views
             Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
             Settings.BroadcastStartTime = startTime;
             Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
+            Settings.UseDebugScheduleDate = UseDebugScheduleDateCheckBox.IsChecked == true;
+            Settings.DebugScheduleDate = DebugScheduleDatePicker.SelectedDate ?? DateTime.Today;
             this.ShowSuccessToast("配置已保存");
         }
 
@@ -74,6 +76,9 @@ namespace VoiceHubComponent.Views
                 Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
                 Settings.BroadcastStartTime = startTime;
                 Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
+                Settings.UseDebugScheduleDate = UseDebugScheduleDateCheckBox.IsChecked == true;
+                Settings.DebugScheduleDate = DebugScheduleDatePicker.SelectedDate ?? DateTime.Today;
+                VoiceHubControl.ClearLyricCache();
                 await VoiceHubControl.RequestManualRefreshAsync();
                 this.ShowSuccessToast("配置已生效，组件已刷新");
             }
@@ -114,6 +119,8 @@ namespace VoiceHubComponent.Views
                 Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
                 Settings.BroadcastStartTime = startTime;
                 Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
+                Settings.UseDebugScheduleDate = UseDebugScheduleDateCheckBox.IsChecked == true;
+                Settings.DebugScheduleDate = DebugScheduleDatePicker.SelectedDate ?? DateTime.Today;
                 VoiceHubControl.ClearLyricCache();
                 await VoiceHubControl.RequestManualRefreshAsync();
                 this.ShowSuccessToast("歌词缓存已清除，正在重新获取");
@@ -192,10 +199,14 @@ namespace VoiceHubComponent.Views
             Settings.EnableLyrics = false;
             Settings.BroadcastStartTime = "12:20:00";
             Settings.NeteaseCookie = string.Empty;
+            Settings.UseDebugScheduleDate = false;
+            Settings.DebugScheduleDate = DateTime.Today;
             ApiUrlTextBox.Text = DefaultApiUrl;
             EnableLyricsCheckBox.IsChecked = false;
             BroadcastStartTimeTextBox.Text = "12:20:00";
             NeteaseCookieTextBox.Text = string.Empty;
+            UseDebugScheduleDateCheckBox.IsChecked = false;
+            DebugScheduleDatePicker.SelectedDate = DateTime.Today;
             this.ShowSuccessToast("已重置为默认API地址");
         }
 

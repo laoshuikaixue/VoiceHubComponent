@@ -53,11 +53,13 @@ namespace VoiceHubComponent
         private static readonly Regex XmlTagRegex = new(@"<[^>]+>", RegexOptions.Compiled);
         private static readonly Regex TencentLegacyIdRegex = new(@"^\d+$", RegexOptions.Compiled);
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
-        private const int LyricCacheVersion = 6;
+        private const int LyricCacheVersion = 8;
         private const int LyricFetchRetryCount = 3;
         private const int MinValidTencentAudioDurationSeconds = 10;
         private const string InvalidTencentAudioUrlSuffix = "/2149972737147268278.mp3";
         private static readonly TimeSpan MetadataLyricDurationTolerance = TimeSpan.FromSeconds(8);
+        private static readonly TimeSpan MaxLyricDurationOvershootTolerance = TimeSpan.FromSeconds(90);
+        private const double MaxLyricDurationOvershootRatio = 0.35;
         private static readonly TimeSpan LastResortSongDuration = TimeSpan.FromMinutes(4);
         private static readonly string CacheDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -314,7 +316,7 @@ namespace VoiceHubComponent
             }
 
             // 找到今天或最近未来的排期
-            var today = DateTime.Today;
+            var today = GetScheduleAnchorDate();
             var todaySchedule = validItems.Where(s => s.GetPlayDate() == today).OrderBy(s => s.Sequence).ToList();
             
             List<SongItem> displayItems;
@@ -363,6 +365,16 @@ namespace VoiceHubComponent
                 SetState(ComponentState.Loaded);
                 ContentText = Settings.EnableLyrics ? GetLyricDisplayText(DateTime.Now) : _scheduleSummaryText;
             });
+        }
+
+        private DateTime GetScheduleAnchorDate()
+        {
+            if (Settings.UseDebugScheduleDate)
+            {
+                return Settings.DebugScheduleDate.Date;
+            }
+
+            return DateTime.Today;
         }
 
         private string BuildScheduleSummary(IReadOnlyList<SongItem> displayItems, DateTime actualDate)
@@ -1087,6 +1099,12 @@ namespace VoiceHubComponent
                 return DurationProbe.Empty;
             }
 
+            _logger?.LogInformation(
+                "VoiceHub QQ resolve-url 原始响应：musicId={MusicId}, url={AudioUrl}, source={Source}",
+                musicId,
+                audioUrl,
+                TryGetString(root, "source"));
+
             if (IsKnownInvalidTencentAudioUrl(audioUrl))
             {
                 _logger?.LogWarning("VoiceHub QQ 解析到已知无效音频链接：{AudioUrl}", audioUrl);
@@ -1210,6 +1228,11 @@ namespace VoiceHubComponent
                 }
 
                 var trustedBitrate = bitrate > 0 ? bitrate : await TryReadMp3BitrateAsync(audioUrl, token);
+                _logger?.LogDebug(
+                    "VoiceHub 音频估算输入：url={AudioUrl}, contentLength={ContentLength}, bitrate={Bitrate}",
+                    audioUrl,
+                    contentLength,
+                    trustedBitrate);
                 return trustedBitrate > 0
                     ? TimeSpan.FromSeconds(contentLength * 8d / trustedBitrate)
                     : TimeSpan.Zero;
@@ -1425,7 +1448,11 @@ namespace VoiceHubComponent
             var tolerance = TimeSpan.FromMilliseconds(Math.Max(
                 MetadataLyricDurationTolerance.TotalMilliseconds,
                 lyricDuration.TotalMilliseconds * 0.15));
-            return duration + tolerance >= lyricDuration;
+            var upperTolerance = TimeSpan.FromMilliseconds(Math.Max(
+                MaxLyricDurationOvershootTolerance.TotalMilliseconds,
+                lyricDuration.TotalMilliseconds * MaxLyricDurationOvershootRatio));
+            return duration + tolerance >= lyricDuration &&
+                   duration <= lyricDuration + upperTolerance;
         }
 
         private static string ComputeMd5Hex(string value)
@@ -1477,7 +1504,7 @@ namespace VoiceHubComponent
             try
             {
                 using var request = new HttpRequestMessage(HttpMethod.Get, audioUrl);
-                request.Headers.Range = new RangeHeaderValue(0, 65535);
+                request.Headers.Range = new RangeHeaderValue(0, 131071);
                 using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
                 var bytes = await response.Content.ReadAsByteArrayAsync(token);
                 return TryReadMp3Bitrate(bytes);
@@ -1491,29 +1518,151 @@ namespace VoiceHubComponent
 
         private static double TryReadMp3Bitrate(byte[] bytes)
         {
-            for (var i = 0; i < bytes.Length - 3; i++)
+            var startOffset = SkipId3v2Tag(bytes);
+            for (var i = startOffset; i < bytes.Length - 4; i++)
             {
-                if (bytes[i] != 0xFF || (bytes[i + 1] & 0xE0) != 0xE0)
+                if (!TryReadMp3FrameHeader(bytes, i, out var bitrate, out var sampleRate, out var frameLength))
                 {
                     continue;
                 }
 
-                var versionBits = (bytes[i + 1] >> 3) & 0x03;
-                var layerBits = (bytes[i + 1] >> 1) & 0x03;
-                var bitrateIndex = (bytes[i + 2] >> 4) & 0x0F;
-                if (versionBits == 1 || layerBits == 0 || bitrateIndex is 0 or 15)
+                var nextFrameOffset = i + frameLength;
+                if (nextFrameOffset + 4 > bytes.Length)
                 {
                     continue;
                 }
 
-                var kbps = GetMp3BitrateKbps(versionBits, layerBits, bitrateIndex);
-                if (kbps > 0)
+                if (TryReadMp3FrameHeader(bytes, nextFrameOffset, out var nextBitrate, out var nextSampleRate, out _)
+                    && Math.Abs(nextBitrate - bitrate) < 0.5
+                    && nextSampleRate == sampleRate)
                 {
-                    return kbps * 1000d;
+                    return bitrate;
                 }
             }
 
             return 0;
+        }
+
+        private static bool TryReadMp3FrameHeader(
+            byte[] bytes,
+            int offset,
+            out double bitrate,
+            out int sampleRate,
+            out int frameLength)
+        {
+            bitrate = 0;
+            sampleRate = 0;
+            frameLength = 0;
+
+            if (offset < 0 || offset + 3 >= bytes.Length)
+            {
+                return false;
+            }
+
+            if (bytes[offset] != 0xFF || (bytes[offset + 1] & 0xE0) != 0xE0)
+            {
+                return false;
+            }
+
+            var versionBits = (bytes[offset + 1] >> 3) & 0x03;
+            var layerBits = (bytes[offset + 1] >> 1) & 0x03;
+            var bitrateIndex = (bytes[offset + 2] >> 4) & 0x0F;
+            var sampleRateIndex = (bytes[offset + 2] >> 2) & 0x03;
+            var padding = (bytes[offset + 2] >> 1) & 0x01;
+
+            if (versionBits == 1 || layerBits == 0 || bitrateIndex is 0 or 15 || sampleRateIndex == 3)
+            {
+                return false;
+            }
+
+            var kbps = GetMp3BitrateKbps(versionBits, layerBits, bitrateIndex);
+            sampleRate = GetMp3SampleRate(versionBits, sampleRateIndex);
+            if (kbps <= 0 || sampleRate <= 0)
+            {
+                return false;
+            }
+
+            frameLength = GetMp3FrameLength(versionBits, layerBits, kbps * 1000, sampleRate, padding);
+            if (frameLength <= 0)
+            {
+                return false;
+            }
+
+            bitrate = kbps * 1000d;
+            return true;
+        }
+
+        private static int SkipId3v2Tag(byte[] bytes)
+        {
+            if (bytes.Length < 10)
+            {
+                return 0;
+            }
+
+            if (bytes[0] != (byte)'I' || bytes[1] != (byte)'D' || bytes[2] != (byte)'3')
+            {
+                return 0;
+            }
+
+            var tagSize =
+                ((bytes[6] & 0x7F) << 21) |
+                ((bytes[7] & 0x7F) << 14) |
+                ((bytes[8] & 0x7F) << 7) |
+                (bytes[9] & 0x7F);
+            var skipSize = 10 + tagSize;
+            if ((bytes[5] & 0x10) != 0)
+            {
+                skipSize += 10;
+            }
+
+            return Math.Min(skipSize, bytes.Length);
+        }
+
+        private static int GetMp3SampleRate(int versionBits, int sampleRateIndex)
+        {
+            return versionBits switch
+            {
+                3 => sampleRateIndex switch
+                {
+                    0 => 44100,
+                    1 => 48000,
+                    2 => 32000,
+                    _ => 0
+                },
+                2 => sampleRateIndex switch
+                {
+                    0 => 22050,
+                    1 => 24000,
+                    2 => 16000,
+                    _ => 0
+                },
+                0 => sampleRateIndex switch
+                {
+                    0 => 11025,
+                    1 => 12000,
+                    2 => 8000,
+                    _ => 0
+                },
+                _ => 0
+            };
+        }
+
+        private static int GetMp3FrameLength(int versionBits, int layerBits, int bitrate, int sampleRate, int padding)
+        {
+            if (bitrate <= 0 || sampleRate <= 0)
+            {
+                return 0;
+            }
+
+            return layerBits switch
+            {
+                3 => ((12 * bitrate) / sampleRate + padding) * 4,
+                2 => (144 * bitrate) / sampleRate + padding,
+                1 => versionBits == 3
+                    ? (144 * bitrate) / sampleRate + padding
+                    : (72 * bitrate) / sampleRate + padding,
+                _ => 0
+            };
         }
 
         private static int GetMp3BitrateKbps(int versionBits, int layerBits, int bitrateIndex)
@@ -1876,11 +2025,6 @@ namespace VoiceHubComponent
         private static bool TryParseTtmlTime(string value, out TimeSpan time)
         {
             value = value.Trim();
-            if (TimeSpan.TryParse(value, CultureInfo.InvariantCulture, out time))
-            {
-                return true;
-            }
-
             if (value.EndsWith("ms", StringComparison.OrdinalIgnoreCase) &&
                 double.TryParse(value[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out var milliseconds))
             {
@@ -1895,8 +2039,30 @@ namespace VoiceHubComponent
                 return true;
             }
 
+            var parts = value.Split(':');
+            if (parts.Length is 1 or 2 or 3)
+            {
+                if (TryParseClockPart(parts[0], out var first) &&
+                    TryParseClockPart(parts.Length > 1 ? parts[1] : "0", out var second) &&
+                    TryParseClockPart(parts.Length > 2 ? parts[2] : "0", out var third))
+                {
+                    time = parts.Length switch
+                    {
+                        3 => TimeSpan.FromHours(first) + TimeSpan.FromMinutes(second) + TimeSpan.FromSeconds(third),
+                        2 => TimeSpan.FromMinutes(first) + TimeSpan.FromSeconds(second),
+                        _ => TimeSpan.FromSeconds(first)
+                    };
+                    return true;
+                }
+            }
+
             time = TimeSpan.Zero;
             return false;
+        }
+
+        private static bool TryParseClockPart(string value, out double parsed)
+        {
+            return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed);
         }
 
         private static string DecodeXmlText(string value)
@@ -1972,7 +2138,8 @@ namespace VoiceHubComponent
             }
 
             var startTime = ResolveBroadcastStartTime(plan);
-            var firstSongStart = playbackDate.Date + startTime;
+            var displayDate = Settings.UseDebugScheduleDate ? now.Date : playbackDate.Date;
+            var firstSongStart = displayDate + startTime;
             if (now < firstSongStart)
             {
                 return _scheduleSummaryText;
