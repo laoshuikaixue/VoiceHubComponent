@@ -713,7 +713,11 @@ namespace VoiceHubComponent
                 try
                 {
                     LyricPayload payload;
-                    if (platform == "tencent" || platform == "qq")
+                    if (platform == "migu")
+                    {
+                        payload = await FetchVoiceHubMiguLyricsAsync(musicId, token);
+                    }
+                    else if (platform == "tencent" || platform == "qq")
                     {
                         try
                         {
@@ -888,6 +892,46 @@ namespace VoiceHubComponent
             return new LyricPayload(lrc, translation, null, null);
         }
 
+        private async Task<LyricPayload> FetchVoiceHubMiguLyricsAsync(string contentId, CancellationToken token)
+        {
+            var origin = GetVoiceHubOrigin();
+            if (origin == null)
+            {
+                return LyricPayload.Empty;
+            }
+
+            _logger?.LogInformation(
+                "VoiceHub 咪咕歌词请求：contentId={ContentId}",
+                contentId);
+            var lyricUrl = new Uri(origin, $"/api/native-api/lyric/mg?contentId={Uri.EscapeDataString(contentId)}");
+            var json = await GetVoiceHubStringAsync(lyricUrl, token);
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            if (root.TryGetProperty("success", out var success) &&
+                success.ValueKind == JsonValueKind.False)
+            {
+                throw new HttpRequestException("VoiceHub 咪咕歌词接口返回失败");
+            }
+
+            if (!root.TryGetProperty("data", out var data))
+            {
+                throw new HttpRequestException("VoiceHub 咪咕歌词接口返回无效数据");
+            }
+
+            var lrc = TryGetString(data, "lrc");
+            var translation = TryGetString(data, "trans");
+            var yrc = TryGetString(data, "yrc");
+            var ttml = TryGetString(data, "ttml");
+            _logger?.LogInformation(
+                "VoiceHub 咪咕歌词响应：contentId={ContentId}, hasLrc={HasLrc}, hasTranslation={HasTranslation}, hasYrc={HasYrc}, hasTtml={HasTtml}",
+                contentId,
+                !string.IsNullOrWhiteSpace(lrc),
+                !string.IsNullOrWhiteSpace(translation),
+                !string.IsNullOrWhiteSpace(yrc),
+                !string.IsNullOrWhiteSpace(ttml));
+            return new LyricPayload(lrc, translation, yrc, ttml);
+        }
+
         private async Task<LyricPayload> FetchVkeysLyricsAsync(string platform, string musicId, CancellationToken token)
         {
             var idParam = GetVkeysIdParam(platform, musicId);
@@ -934,9 +978,12 @@ namespace VoiceHubComponent
 
             try
             {
-                var duration = platform == "tencent" || platform == "qq"
-                    ? await FetchTencentDurationAsync(musicId, token)
-                    : await FetchNeteaseDurationAsync(musicId, token);
+                var duration = platform switch
+                {
+                    "tencent" or "qq" => await FetchTencentDurationAsync(musicId, token),
+                    "migu" => await FetchMiguDurationAsync(musicId, token),
+                    _ => await FetchNeteaseDurationAsync(musicId, token)
+                };
                 return duration;
             }
             catch (Exception ex)
@@ -1017,6 +1064,12 @@ namespace VoiceHubComponent
             if (platform is "tencent" or "qq")
             {
                 return await FetchVoiceHubResolvedAudioDurationAsync(song, lyricDuration, token);
+            }
+
+            if (platform == "migu")
+            {
+                // 咪咕官方播放链接探测时长，不依赖第三方音源
+                return await FetchMiguDurationAsync(musicId, token);
             }
 
             foreach (var fetcher in new Func<string, CancellationToken, Task<DurationProbe>>[]
@@ -1128,6 +1181,53 @@ namespace VoiceHubComponent
 
             return IsDurationTrusted(estimatedDuration, lyricDuration)
                 ? new DurationProbe(estimatedDuration, "voicehub-audio")
+                : DurationProbe.Empty;
+        }
+
+        private async Task<DurationProbe> FetchMiguDurationAsync(string contentId, CancellationToken token)
+        {
+            var origin = GetVoiceHubOrigin();
+            if (origin == null)
+            {
+                return DurationProbe.Empty;
+            }
+
+            // 咪咕匿名仅提供 128k，固定使用 PQ
+            var url = new Uri(origin, $"/api/native-api/migu/playurl?contentId={Uri.EscapeDataString(contentId)}&toneFlag=PQ");
+            var json = await GetVoiceHubStringAsync(url, token);
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("success", out var success) ||
+                success.ValueKind != JsonValueKind.True)
+            {
+                _logger?.LogWarning(
+                    "VoiceHub 咪咕 playurl 响应 success=false：contentId={ContentId}",
+                    contentId);
+                return DurationProbe.Empty;
+            }
+
+            var audioUrl = TryGetString(root, "url");
+            if (string.IsNullOrWhiteSpace(audioUrl))
+            {
+                _logger?.LogWarning(
+                    "VoiceHub 咪咕 playurl 未返回音频 URL：contentId={ContentId}",
+                    contentId);
+                return DurationProbe.Empty;
+            }
+
+            _logger?.LogInformation(
+                "VoiceHub 咪咕 playurl 响应：contentId={ContentId}, url={AudioUrl}, source={Source}",
+                contentId,
+                audioUrl,
+                TryGetString(root, "source"));
+
+            var estimatedDuration = await EstimateAudioDurationFromUrlAsync(audioUrl, 0, token);
+            _logger?.LogInformation(
+                "VoiceHub 咪咕音频时长估算完成：contentId={ContentId}, duration={Duration}",
+                contentId,
+                estimatedDuration);
+            return estimatedDuration > TimeSpan.Zero
+                ? new DurationProbe(estimatedDuration, "migu-official")
                 : DurationProbe.Empty;
         }
 
