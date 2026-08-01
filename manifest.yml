@@ -5,5 +5,5 @@ description: 展示广播站当日排期歌曲，按播放顺序显示歌曲信�
 entranceAssembly: "VoiceHubComponent.dll"  # 插件入口程序集
 url: https://github.com/laoshuikaixue/VoiceHubComponent  # 插件 Url
 author: LaoShui  # 插件作者
-version: 1.0.0.8  # 插件版本
+version: 1.0.0.9  # 插件版本
 icon: icon.png
