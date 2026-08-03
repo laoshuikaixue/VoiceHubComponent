@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -8,19 +8,23 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
+using Avalonia.Animation;
+using Avalonia.Animation.Easings;
 using Avalonia.Controls;
-using Avalonia.Threading;
 using Avalonia.Media;
-using Avalonia.VisualTree;
+using Avalonia.Media.Imaging;
+using Avalonia.Styling;
+using Avalonia.Threading;
 using ClassIsland.Core.Abstractions.Controls;
 using ClassIsland.Core.Attributes;
 using ClassIsland.Shared;
 using Microsoft.Extensions.Logging;
+using VoiceHubComponent.Cache;
 using VoiceHubComponent.Models;
+using VoiceHubComponent.Services;
 
 namespace VoiceHubComponent
 {
@@ -28,7 +32,7 @@ namespace VoiceHubComponent
         "A1B2C3D4-E5F6-7890-ABCD-EF1234567890",
         "VoiceHub广播站排期",
         "\ue42b",
-        "展示VoiceHub广播站当日排期歌曲，按播放顺序显示歌曲信息。"
+        "展示VoiceHub广播站当日排期歌曲，左侧显示正在播放与封面，右侧显示高级歌词。"
     )]
     public partial class VoiceHubControl : ComponentBase<VoiceHubSettings>
     {
@@ -39,21 +43,14 @@ namespace VoiceHubComponent
         private ComponentState _currentState = ComponentState.Loading;
         private readonly DispatcherTimer _refreshTimer;
         private readonly DispatcherTimer _lyricTimer;
+        private readonly LyricUpgradeService _upgradeService;
         private CancellationTokenSource _lyricsCts = new();
         private List<ScheduledSongPlayback> _playbackPlan = new();
         private readonly object _playbackLock = new();
         private DateTime _playbackDate = DateTime.MinValue;
         private string _scheduleSummaryText = string.Empty;
-        private static readonly Regex LrcTimeRegex = new(@"\[(\d{1,2}):(\d{2})(?:[\.:](\d{1,3}))?\]", RegexOptions.Compiled);
-        private static readonly Regex EnhancedWordRegex = new(@"<(\d{1,2}):(\d{2})(?:[\.:](\d{1,3}))?>([^<]*)", RegexOptions.Compiled);
-        private static readonly Regex QrcLineRegex = new(@"^\[(\d+),(\d+)\](.*)$", RegexOptions.Compiled);
-        private static readonly Regex QrcWordRegex = new(@"([^(]*)\((\d+),(\d+)\)", RegexOptions.Compiled);
-        private static readonly Regex TtmlLineRegex = new(@"<(?:p|span)[^>]*?begin=""([^""]+)""[^>]*?(?:end=""([^""]+)""|dur=""([^""]+)"")?[^>]*>(.*?)</(?:p|span)>", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        private static readonly Regex LrcMetaRegex = new(@"^\[[a-z]+:", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-        private static readonly Regex XmlTagRegex = new(@"<[^>]+>", RegexOptions.Compiled);
-        private static readonly Regex TencentLegacyIdRegex = new(@"^\d+$", RegexOptions.Compiled);
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
-        private const int LyricCacheVersion = 8;
+        private const int LyricCacheVersion = 9;
         private const int LyricFetchRetryCount = 3;
         private const int MinValidTencentAudioDurationSeconds = 10;
         private const string InvalidTencentAudioUrlSuffix = "/2149972737147268278.mp3";
@@ -64,7 +61,20 @@ namespace VoiceHubComponent
         private static readonly string CacheDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "ClassIsland", "Plugins", "VoiceHubComponent", "Cache");
-        
+
+        // 点歌人为超级管理员时不显示
+        private const string HiddenRequesterName = "超级管理员";
+
+        // 封面显示相关
+        private static readonly TimeSpan CoverTransitionDuration = TimeSpan.FromMilliseconds(180);
+        private readonly Dictionary<string, Bitmap?> _coverBitmapCache = new(StringComparer.OrdinalIgnoreCase);
+        private Bitmap? _displayedCover;
+        private string? _displayedCoverKey;
+        private CancellationTokenSource? _coverTransitionCancellation;
+
+        // 当前展示歌曲标识（避免重复刷新左侧面板）
+        private string? _currentPlaybackKey;
+
         // UI 状态属性
         public static readonly DirectProperty<VoiceHubControl, bool> IsLoadingProperty =
             AvaloniaProperty.RegisterDirect<VoiceHubControl, bool>(nameof(IsLoading), o => o.IsLoading);
@@ -104,12 +114,18 @@ namespace VoiceHubComponent
         public VoiceHubControl()
         {
             InitializeComponent();
+            _upgradeService = new LyricUpgradeService(
+                _httpClient,
+                GetVoiceHubOrigin,
+                GetVoiceHubStringAsync,
+                FetchLyricsWithoutUpgradeAsync,
+                _logger);
             ManualRefreshRequested += HandleManualRefreshRequestedAsync;
             DetachedFromVisualTree += VoiceHubControl_DetachedFromVisualTree;
-            
+
             // 设置HTTP客户端超时
             _httpClient.Timeout = TimeSpan.FromSeconds(10);
-            
+
             // 初始化定时器，正常情况下1小时刷新一次，失败后1分钟检查一次
             _refreshTimer = new DispatcherTimer
             {
@@ -124,7 +140,7 @@ namespace VoiceHubComponent
             };
             _lyricTimer.Tick += (_, _) => UpdateLyricDisplay();
             _lyricTimer.Start();
-            
+
             // 初始化加载超时守护
             _loadingGuardTimer = new DispatcherTimer { Interval = _loadingTimeout };
             _loadingGuardTimer.Tick += async (s, e) =>
@@ -202,13 +218,14 @@ namespace VoiceHubComponent
             _refreshTimer.Stop();
             _lyricTimer.Stop();
             _loadingGuardTimer.Stop();
+            StopCoverTransition(true);
             _httpClient.Dispose();
         }
 
         private void UpdateTimerInterval()
         {
             // 如果有失败记录且还在冷却期内，设置为1分钟检查一次
-            if (_lastFailureTime != DateTime.MinValue && 
+            if (_lastFailureTime != DateTime.MinValue &&
                 DateTime.Now - _lastFailureTime < _retryDelay)
             {
                 _refreshTimer.Interval = TimeSpan.FromMinutes(1);
@@ -224,13 +241,13 @@ namespace VoiceHubComponent
         {
             // 更新定时器间隔
             UpdateTimerInterval();
-            
+
             // 检查是否需要等待（上次失败后的冷却时间）
-            if (_lastFailureTime != DateTime.MinValue && 
+            if (_lastFailureTime != DateTime.MinValue &&
                 DateTime.Now - _lastFailureTime < _retryDelay)
             {
                 var remainingTime = _retryDelay - (DateTime.Now - _lastFailureTime);
-                await Dispatcher.UIThread.InvokeAsync(() => 
+                await Dispatcher.UIThread.InvokeAsync(() =>
                     SetState(ComponentState.NetworkError, $"等待重试中... ({remainingTime.Minutes}分{remainingTime.Seconds}秒后重试)"));
                 return;
             }
@@ -241,11 +258,11 @@ namespace VoiceHubComponent
                 try
                 {
                     await LoadVoiceHubDataCoreAsync();
-                    
+
                     // 成功加载，重置重试计数和失败时间
                     _retryCount = 0;
                     _lastFailureTime = DateTime.MinValue;
-                    
+
                     // 成功后恢复正常定时器间隔
                     await Dispatcher.UIThread.InvokeAsync(UpdateTimerInterval);
                     return;
@@ -253,13 +270,13 @@ namespace VoiceHubComponent
                 catch (Exception ex)
                 {
                     _retryCount = attempt + 1;
-                    
+
                     // 如果还有重试机会
                     if (attempt < MaxRetryCount)
                     {
-                        await Dispatcher.UIThread.InvokeAsync(() => 
+                        await Dispatcher.UIThread.InvokeAsync(() =>
                             SetState(ComponentState.NetworkError, $"获取失败，正在重试... ({_retryCount}/{MaxRetryCount})"));
-                        
+
                         // 等待一段时间后重试（递增延迟：2秒、4秒、8秒）
                         var retryDelay = TimeSpan.FromSeconds(Math.Pow(2, attempt + 1));
                         await Task.Delay(retryDelay);
@@ -268,16 +285,16 @@ namespace VoiceHubComponent
                     {
                         // 所有重试都失败了，记录失败时间并设置错误状态
                         _lastFailureTime = DateTime.Now;
-                        
+
                         string errorMessage = ex switch
                         {
                             HttpRequestException => "网络连接错误，10分钟后重试",
-                            TaskCanceledException => "请求超时，10分钟后重试", 
+                            TaskCanceledException => "请求超时，10分钟后重试",
                             JsonException => "数据格式错误，10分钟后重试",
                             _ => "获取失败，10分钟后重试"
                         };
-                        
-                        await Dispatcher.UIThread.InvokeAsync(() => 
+
+                        await Dispatcher.UIThread.InvokeAsync(() =>
                         {
                             SetState(ComponentState.NetworkError, errorMessage);
                             UpdateTimerInterval();
@@ -291,12 +308,12 @@ namespace VoiceHubComponent
         {
             // 设置加载状态
             await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.Loading));
-            
+
             // 使用配置的API地址
-            var apiUrl = !string.IsNullOrEmpty(Settings.ApiUrl) 
-                ? Settings.ApiUrl 
+            var apiUrl = !string.IsNullOrEmpty(Settings.ApiUrl)
+                ? Settings.ApiUrl
                 : "https://voicehub.lao-shui.top/api/songs/public";
-            
+
             var jsonResponse = await _httpClient.GetStringAsync(apiUrl);
             var songItems = JsonSerializer.Deserialize<List<SongItem>>(jsonResponse);
 
@@ -308,7 +325,7 @@ namespace VoiceHubComponent
 
             // 过滤掉无效日期的项目
             var validItems = songItems.Where(s => s.GetPlayDate() != DateTime.MinValue).ToList();
-            
+
             if (!validItems.Any())
             {
                 await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, "暂无有效排期数据"));
@@ -318,10 +335,10 @@ namespace VoiceHubComponent
             // 找到今天或最近未来的排期
             var today = GetScheduleAnchorDate();
             var todaySchedule = validItems.Where(s => s.GetPlayDate() == today).OrderBy(s => s.Sequence).ToList();
-            
+
             List<SongItem> displayItems;
             DateTime actualDate;
-            
+
             if (todaySchedule.Any())
             {
                 displayItems = todaySchedule;
@@ -335,7 +352,7 @@ namespace VoiceHubComponent
                     .GroupBy(s => s.GetPlayDate())
                     .OrderBy(g => g.Key)
                     .FirstOrDefault();
-                
+
                 if (futureSchedule != null)
                 {
                     displayItems = futureSchedule.OrderBy(s => s.Sequence).ToList();
@@ -360,10 +377,10 @@ namespace VoiceHubComponent
             _scheduleSummaryText = BuildScheduleSummary(displayItems, actualDate);
             await BuildPlaybackPlanAsync(displayItems, actualDate);
 
-            await Dispatcher.UIThread.InvokeAsync(() => 
+            await Dispatcher.UIThread.InvokeAsync(() =>
             {
                 SetState(ComponentState.Loaded);
-                ContentText = Settings.EnableLyrics ? GetLyricDisplayText(DateTime.Now) : _scheduleSummaryText;
+                UpdateLyricDisplay();
             });
         }
 
@@ -385,7 +402,9 @@ namespace VoiceHubComponent
             var songInfos = displayItems.Select(item =>
             {
                 var song = item.Song;
-                return $"#{item.Sequence} {song.Artist} - {song.Title} - {song.Requester}";
+                var replayMark = song.IsReplay ? " [重播]" : string.Empty;
+                var requesterText = ShouldHideRequester(song.Requester) ? string.Empty : $" - {song.Requester}";
+                return $"#{item.Sequence}{replayMark} {song.Artist} - {song.Title}{requesterText}";
             });
             sb.Append(string.Join(" | ", songInfos));
 
@@ -425,7 +444,7 @@ namespace VoiceHubComponent
 
         private static bool IsTencentLegacyNumericId(string musicId)
         {
-            return TencentLegacyIdRegex.IsMatch(NormalizeTencentMusicId(musicId));
+            return System.Text.RegularExpressions.Regex.IsMatch(NormalizeTencentMusicId(musicId), @"^\d+$");
         }
 
         private static (string Key, string Value) GetVkeysIdParam(string platform, string musicId)
@@ -557,6 +576,7 @@ namespace VoiceHubComponent
             playback.LyricStatus = string.IsNullOrWhiteSpace(cacheEntry.LyricStatus)
                 ? (cacheEntry.Lyrics.Count > 0 ? "ready" : "no-lyrics")
                 : cacheEntry.LyricStatus;
+            playback.LyricFormat = string.IsNullOrWhiteSpace(cacheEntry.LyricFormat) ? "lrc" : cacheEntry.LyricFormat;
             playback.Lyrics = cacheEntry.Lyrics.Select(line => line.ToLyricLineItem()).ToList();
         }
 
@@ -601,10 +621,11 @@ namespace VoiceHubComponent
                         cachedEntry.IsUsable())
                     {
                         _logger?.LogInformation(
-                            "VoiceHub 歌词缓存命中：{CacheKey}, status={LyricStatus}, lines={LineCount}, durationSource={DurationSource}",
+                            "VoiceHub 歌词缓存命中：{CacheKey}, status={LyricStatus}, lines={LineCount}, format={LyricFormat}, durationSource={DurationSource}",
                             cacheKey,
                             cachedEntry.LyricStatus,
                             cachedEntry.Lyrics.Count,
+                            cachedEntry.LyricFormat,
                             cachedEntry.DurationSource);
                         foreach (var entry in group)
                         {
@@ -620,6 +641,7 @@ namespace VoiceHubComponent
                         entry.DurationSource = resolved.DurationSource;
                         entry.Lyrics = resolved.Lyrics.Select(line => line.Clone()).ToList();
                         entry.LyricStatus = resolved.LyricStatus;
+                        entry.LyricFormat = resolved.LyricFormat;
                     }
 
                     if (!string.IsNullOrWhiteSpace(cacheKey))
@@ -628,11 +650,12 @@ namespace VoiceHubComponent
                     }
 
                     _logger?.LogInformation(
-                        "VoiceHub 歌曲解析完成：{Platform}:{MusicId}, status={LyricStatus}, lines={LineCount}, duration={Duration}, durationSource={DurationSource}",
+                        "VoiceHub 歌曲解析完成：{Platform}:{MusicId}, status={LyricStatus}, lines={LineCount}, format={LyricFormat}, duration={Duration}, durationSource={DurationSource}",
                         NormalizePlatform(firstEntry.Item.Song.MusicPlatform),
                         firstEntry.Item.Song.MusicId ?? firstEntry.Item.Song.Id.ToString(CultureInfo.InvariantCulture),
                         resolved.LyricStatus,
                         resolved.Lyrics.Count,
+                        resolved.LyricFormat,
                         resolved.Duration,
                         resolved.DurationSource);
                 }
@@ -653,50 +676,121 @@ namespace VoiceHubComponent
 
         private async Task<ResolvedPlayback> ResolveSongPlaybackAsync(Song song, CancellationToken token)
         {
+            var platform = NormalizePlatform(song.MusicPlatform);
             var payload = await FetchLyricsAsync(song, token);
-            var lyrics = ParseBestLyrics(payload);
+            var parsed = LyricParser.ParseBestLyrics(payload);
+            var lyrics = parsed.Lines;
+            var format = lyrics.Count > 0 ? parsed.Format : "none";
+            var wordTimingLines = lyrics.Count(line => line.HasWordTiming);
             _logger?.LogInformation(
-                "VoiceHub 歌词解析行数：{Platform}:{MusicId}, lines={LineCount}, hasTranslation={HasTranslation}",
-                NormalizePlatform(song.MusicPlatform),
+                "VoiceHub 歌词解析行数：{Platform}:{MusicId}, lines={LineCount}, wordLines={WordLines}, format={LyricFormat}, hasTranslation={HasTranslation}, hasRoma={HasRoma}",
+                platform,
                 song.MusicId ?? song.Id.ToString(CultureInfo.InvariantCulture),
                 lyrics.Count,
-                !string.IsNullOrWhiteSpace(payload.Translation));
+                wordTimingLines,
+                format,
+                !string.IsNullOrWhiteSpace(payload.Translation),
+                !string.IsNullOrWhiteSpace(payload.Roma));
             if (!string.IsNullOrWhiteSpace(payload.Translation))
             {
-                AlignTranslations(lyrics, ParseSmartLrc(payload.Translation));
+                LyricParser.AlignTranslations(lyrics, LyricParser.ParseSmartLrc(payload.Translation));
             }
 
-            var lyricDuration = GetEstimatedDuration(lyrics, TimeSpan.Zero);
+            if (!string.IsNullOrWhiteSpace(payload.Roma))
+            {
+                LyricParser.AlignRomanizations(lyrics, LyricParser.ParseSmartLrc(payload.Roma));
+            }
+
+            var lyricDuration = LyricParser.GetEstimatedDuration(lyrics, TimeSpan.Zero);
+            var durationProbe = await ResolveDurationAsync(song, lyricDuration, token);
+
+            // 歌词升级：仅在开启逐字歌词时发起，关闭时保持原有歌词，避免引入不确定性
+            if (Settings.WordByWord && Settings.EnableLyricUpgrade && lyrics.Count > 0)
+            {
+                try
+                {
+                    var meta = new LyricUpgradeMeta
+                    {
+                        Title = song.Title,
+                        Artist = song.Artist,
+                        DurationMs = durationProbe.Duration.TotalMilliseconds
+                    };
+                    var upgraded = await _upgradeService.TryUpgradeAsync(platform, payload, lyrics, meta, token);
+                    if (upgraded != null)
+                    {
+                        lyrics = upgraded.Lines;
+                        format = upgraded.Format;
+                        _logger?.LogInformation(
+                            "VoiceHub 歌词升级生效：{Platform}:{MusicId}, format={LyricFormat}, lines={LineCount}",
+                            platform,
+                            song.MusicId ?? song.Id.ToString(CultureInfo.InvariantCulture),
+                            format,
+                            lyrics.Count);
+                        // 升级后歌词时间轴变化，重新按歌词估算时长兜底
+                        if (durationProbe.Source == "fallback")
+                        {
+                            var upgradedEstimate = LyricParser.GetEstimatedDuration(lyrics, TimeSpan.Zero);
+                            if (upgradedEstimate > TimeSpan.Zero)
+                            {
+                                durationProbe = new DurationProbe(upgradedEstimate, "fallback");
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "VoiceHub 歌词升级失败，保持原歌词：{Platform}:{MusicId}",
+                        platform, song.MusicId ?? song.Id.ToString(CultureInfo.InvariantCulture));
+                }
+            }
+
+            return new ResolvedPlayback(
+                durationProbe.Duration,
+                durationProbe.Source,
+                lyrics,
+                lyrics.Count > 0 ? "ready" : "no-lyrics",
+                format);
+        }
+
+        /// <summary>
+        /// 解析歌曲时长：官方元数据 > 音频探测 > 歌词估算
+        /// </summary>
+        private async Task<DurationProbe> ResolveDurationAsync(Song song, TimeSpan lyricDuration, CancellationToken token)
+        {
             var officialDuration = await FetchOfficialDurationAsync(song, token);
             if (officialDuration.Duration > TimeSpan.Zero)
             {
                 if (IsDurationTrusted(officialDuration.Duration, lyricDuration))
                 {
-                    return new ResolvedPlayback(officialDuration.Duration, officialDuration.Source, lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+                    return officialDuration;
                 }
 
                 var fallbackAudioDuration = await FetchFallbackAudioDurationAsync(song, lyricDuration, token);
                 if (fallbackAudioDuration.Duration > TimeSpan.Zero)
                 {
-                    return new ResolvedPlayback(fallbackAudioDuration.Duration, fallbackAudioDuration.Source, lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+                    return fallbackAudioDuration;
                 }
 
-                return BuildEstimatedPlayback(lyricDuration, lyrics);
+                return BuildEstimatedProbe(lyricDuration);
             }
 
             var audioDuration = await FetchFallbackAudioDurationAsync(song, lyricDuration, token);
             if (audioDuration.Duration > TimeSpan.Zero)
             {
-                return new ResolvedPlayback(audioDuration.Duration, audioDuration.Source, lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+                return audioDuration;
             }
 
-            return BuildEstimatedPlayback(lyricDuration, lyrics);
+            return BuildEstimatedProbe(lyricDuration);
         }
 
-        private static ResolvedPlayback BuildEstimatedPlayback(TimeSpan lyricDuration, List<LyricLineItem> lyrics)
+        private static DurationProbe BuildEstimatedProbe(TimeSpan lyricDuration)
         {
             var duration = lyricDuration > TimeSpan.Zero ? lyricDuration : LastResortSongDuration;
-            return new ResolvedPlayback(duration, "fallback", lyrics, lyrics.Count > 0 ? "ready" : "no-lyrics");
+            return new DurationProbe(duration, "fallback");
         }
 
         private async Task<LyricPayload> FetchLyricsAsync(Song song, CancellationToken token)
@@ -721,7 +815,7 @@ namespace VoiceHubComponent
                     {
                         try
                         {
-                            payload = await FetchVoiceHubTencentLyricsAsync(musicId, token);
+                            payload = await FetchVoiceHubTencentLyricsAsync(song, musicId, token);
                         }
                         catch (Exception ex)
                         {
@@ -734,6 +828,7 @@ namespace VoiceHubComponent
 
                         if (string.IsNullOrWhiteSpace(payload.Lrc) &&
                             string.IsNullOrWhiteSpace(payload.Yrc) &&
+                            string.IsNullOrWhiteSpace(payload.Qrc) &&
                             string.IsNullOrWhiteSpace(payload.Ttml))
                         {
                             payload = await FetchVkeysLyricsAsync("tencent", musicId, token);
@@ -795,6 +890,31 @@ namespace VoiceHubComponent
             return LyricPayload.Empty;
         }
 
+        /// <summary>
+        /// 歌词升级候选获取：失败时返回空载荷而不抛出
+        /// </summary>
+        private async Task<LyricPayload> FetchLyricsWithoutUpgradeAsync(string platform, string musicId, CancellationToken token)
+        {
+            var song = new Song
+            {
+                MusicPlatform = platform,
+                MusicId = musicId
+            };
+            try
+            {
+                return await FetchLyricsAsync(song, token);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "VoiceHub 歌词升级候选歌词获取失败：{Platform}:{MusicId}", platform, musicId);
+                return LyricPayload.Empty;
+            }
+        }
+
         private async Task<LyricPayload> FetchVoiceHubNeteaseLyricsAsync(string musicId, CancellationToken token)
         {
             var origin = GetVoiceHubOrigin();
@@ -853,7 +973,7 @@ namespace VoiceHubComponent
             return new LyricPayload(lrc, translation, yrc, null);
         }
 
-        private async Task<LyricPayload> FetchVoiceHubTencentLyricsAsync(string musicId, CancellationToken token)
+        private async Task<LyricPayload> FetchVoiceHubTencentLyricsAsync(Song song, string musicId, CancellationToken token)
         {
             var origin = GetVoiceHubOrigin();
             if (origin == null)
@@ -862,11 +982,23 @@ namespace VoiceHubComponent
             }
 
             var idParam = GetTencentNativeLyricIdParam(musicId);
+            var urlBuilder = new StringBuilder($"/api/native-api/lyric/tx?{idParam.Key}={Uri.EscapeDataString(idParam.Value)}");
+            // 携带歌曲元数据，帮助服务端原生 QRC 接口解析逐字歌词
+            if (!string.IsNullOrWhiteSpace(song.Title))
+            {
+                urlBuilder.Append("&name=").Append(Uri.EscapeDataString(song.Title.Trim()));
+            }
+
+            if (!string.IsNullOrWhiteSpace(song.Artist))
+            {
+                urlBuilder.Append("&artist=").Append(Uri.EscapeDataString(song.Artist.Trim()));
+            }
+
             _logger?.LogInformation(
                 "VoiceHub QQ 原生歌词请求：{IdKey}={IdValue}",
                 idParam.Key,
                 idParam.Value);
-            var lyricUrl = new Uri(origin, $"/api/native-api/lyric/tx?{idParam.Key}={Uri.EscapeDataString(idParam.Value)}");
+            var lyricUrl = new Uri(origin, urlBuilder.ToString());
             var json = await GetVoiceHubStringAsync(lyricUrl, token);
             using var document = JsonDocument.Parse(json);
             var root = document.RootElement;
@@ -883,13 +1015,17 @@ namespace VoiceHubComponent
 
             var lrc = TryGetString(data, "lrc");
             var translation = TryGetString(data, "trans");
+            var qrc = TryGetString(data, "qrc");
+            var roma = TryGetString(data, "roma");
             _logger?.LogInformation(
-                "VoiceHub QQ 原生歌词响应：{IdKey}={IdValue}, hasLrc={HasLrc}, hasTranslation={HasTranslation}",
+                "VoiceHub QQ 原生歌词响应：{IdKey}={IdValue}, hasLrc={HasLrc}, hasTranslation={HasTranslation}, hasQrc={HasQrc}, hasRoma={HasRoma}",
                 idParam.Key,
                 idParam.Value,
                 !string.IsNullOrWhiteSpace(lrc),
-                !string.IsNullOrWhiteSpace(translation));
-            return new LyricPayload(lrc, translation, null, null);
+                !string.IsNullOrWhiteSpace(translation),
+                !string.IsNullOrWhiteSpace(qrc),
+                !string.IsNullOrWhiteSpace(roma));
+            return new LyricPayload(lrc, translation, null, null, qrc, roma);
         }
 
         private async Task<LyricPayload> FetchVoiceHubMiguLyricsAsync(string contentId, CancellationToken token)
@@ -1786,431 +1922,9 @@ namespace VoiceHubComponent
                     : mpeg2Layer23[bitrateIndex];
         }
 
-        private static List<LyricLineItem> ParseBestLyrics(LyricPayload payload)
-        {
-            if (!string.IsNullOrWhiteSpace(payload.Ttml))
-            {
-                var ttmlLines = ParseTtml(payload.Ttml);
-                if (ttmlLines.Count > 0)
-                {
-                    return ttmlLines;
-                }
-            }
+        // ========== 显示逻辑 ==========
 
-            if (!string.IsNullOrWhiteSpace(payload.Yrc))
-            {
-                var qrcLines = ParseQrc(payload.Yrc);
-                if (qrcLines.Count > 0)
-                {
-                    return qrcLines;
-                }
-
-                var yrcLines = ParseSmartLrc(payload.Yrc);
-                if (yrcLines.Count > 0)
-                {
-                    return yrcLines;
-                }
-            }
-
-            return ParseSmartLrc(payload.Lrc);
-        }
-
-        private static List<LyricLineItem> ParseSmartLrc(string? lrc)
-        {
-            if (string.IsNullOrWhiteSpace(lrc))
-            {
-                return new List<LyricLineItem>();
-            }
-
-            if (lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
-                .Any(line => EnhancedWordRegex.IsMatch(line)))
-            {
-                var enhancedLines = ParseEnhancedLrc(lrc);
-                if (enhancedLines.Count > 0)
-                {
-                    return enhancedLines;
-                }
-            }
-
-            if (lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
-                .Any(line => LrcTimeRegex.Matches(line).Count > 1))
-            {
-                var wordByWordLines = ParseWordByWordLrc(lrc);
-                if (wordByWordLines.Count > 0)
-                {
-                    return wordByWordLines;
-                }
-            }
-
-            return ParseLineLrc(lrc);
-        }
-
-        private static List<LyricLineItem> ParseLineLrc(string? lrc)
-        {
-            var result = new List<LyricLineItem>();
-            if (string.IsNullOrWhiteSpace(lrc))
-            {
-                return result;
-            }
-
-            foreach (var rawLine in lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
-            {
-                var line = rawLine.Trim();
-                if (string.IsNullOrEmpty(line) || LrcMetaRegex.IsMatch(line))
-                {
-                    continue;
-                }
-
-                var matches = LrcTimeRegex.Matches(line);
-                if (matches.Count == 0)
-                {
-                    continue;
-                }
-
-                var text = LrcTimeRegex.Replace(line, string.Empty).Trim();
-                if (string.IsNullOrEmpty(text))
-                {
-                    continue;
-                }
-
-                foreach (Match match in matches)
-                {
-                    result.Add(new LyricLineItem
-                    {
-                        Start = ParseLrcTimestamp(match),
-                        Text = text
-                    });
-                }
-            }
-
-            result = result.OrderBy(line => line.Start).ToList();
-            for (var i = 0; i < result.Count; i++)
-            {
-                result[i].End = i + 1 < result.Count
-                    ? result[i + 1].Start
-                    : result[i].Start + TimeSpan.FromSeconds(5);
-            }
-
-            return result;
-        }
-
-        private static List<LyricLineItem> ParseWordByWordLrc(string lrc)
-        {
-            var result = new List<LyricLineItem>();
-            foreach (var rawLine in lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
-            {
-                var line = rawLine.Trim();
-                if (string.IsNullOrEmpty(line) || LrcMetaRegex.IsMatch(line))
-                {
-                    continue;
-                }
-
-                var matches = LrcTimeRegex.Matches(line).Cast<Match>().ToList();
-                if (matches.Count == 0)
-                {
-                    continue;
-                }
-
-                var segments = new List<(TimeSpan Start, string Text)>();
-                for (var i = 0; i < matches.Count; i++)
-                {
-                    var match = matches[i];
-                    var contentStart = match.Index + match.Length;
-                    var contentEnd = i + 1 < matches.Count ? matches[i + 1].Index : line.Length;
-                    var text = line[contentStart..contentEnd];
-                    if (!string.IsNullOrEmpty(text))
-                    {
-                        segments.Add((ParseLrcTimestamp(match), text));
-                    }
-                }
-
-                if (segments.Count == 0)
-                {
-                    continue;
-                }
-
-                var lineText = string.Concat(segments.Select(segment => segment.Text)).Trim();
-                if (string.IsNullOrEmpty(lineText))
-                {
-                    continue;
-                }
-
-                result.Add(new LyricLineItem
-                {
-                    Start = segments.Min(segment => segment.Start),
-                    End = segments.Last().Start + TimeSpan.FromSeconds(1),
-                    Text = lineText
-                });
-            }
-
-            CompleteLineEndTimes(result);
-            return result;
-        }
-
-        private static List<LyricLineItem> ParseEnhancedLrc(string lrc)
-        {
-            var result = new List<LyricLineItem>();
-            foreach (var rawLine in lrc.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
-            {
-                var line = rawLine.Trim();
-                if (string.IsNullOrEmpty(line) || LrcMetaRegex.IsMatch(line))
-                {
-                    continue;
-                }
-
-                var lineMatch = LrcTimeRegex.Match(line);
-                if (!lineMatch.Success)
-                {
-                    continue;
-                }
-
-                var contentAfterLineTime = line[(lineMatch.Index + lineMatch.Length)..];
-                var wordMatches = EnhancedWordRegex.Matches(contentAfterLineTime).Cast<Match>().ToList();
-                var text = wordMatches.Count > 0
-                    ? string.Concat(wordMatches.Select(match => match.Groups[4].Value)).Trim()
-                    : EnhancedWordRegex.Replace(contentAfterLineTime, string.Empty).Trim();
-
-                if (string.IsNullOrWhiteSpace(text))
-                {
-                    continue;
-                }
-
-                var start = ParseLrcTimestamp(lineMatch);
-                var end = wordMatches.Count > 0
-                    ? ParseEnhancedTimestamp(wordMatches.Last()) + TimeSpan.FromSeconds(1)
-                    : start + TimeSpan.FromSeconds(1);
-
-                result.Add(new LyricLineItem { Start = start, End = end, Text = text });
-            }
-
-            CompleteLineEndTimes(result);
-            return result;
-        }
-
-        private static List<LyricLineItem> ParseQrc(string? content)
-        {
-            var result = new List<LyricLineItem>();
-            if (string.IsNullOrWhiteSpace(content))
-            {
-                return result;
-            }
-
-            var rawContent = ExtractQrcLyricContent(content) ?? content;
-            foreach (var rawLine in rawContent.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
-            {
-                var line = rawLine.Trim();
-                if (string.IsNullOrEmpty(line) || LrcMetaRegex.IsMatch(line))
-                {
-                    continue;
-                }
-
-                var lineMatch = QrcLineRegex.Match(line);
-                if (!lineMatch.Success)
-                {
-                    continue;
-                }
-
-                var startMs = long.Parse(lineMatch.Groups[1].Value, CultureInfo.InvariantCulture);
-                var durationMs = long.Parse(lineMatch.Groups[2].Value, CultureInfo.InvariantCulture);
-                var lineContent = lineMatch.Groups[3].Value;
-                var words = QrcWordRegex.Matches(lineContent)
-                    .Cast<Match>()
-                    .Select(match => match.Groups[1].Value)
-                    .Where(word => !string.IsNullOrEmpty(word));
-                var text = string.Concat(words).Trim();
-                if (string.IsNullOrWhiteSpace(text))
-                {
-                    continue;
-                }
-
-                result.Add(new LyricLineItem
-                {
-                    Start = TimeSpan.FromMilliseconds(startMs),
-                    End = TimeSpan.FromMilliseconds(startMs + durationMs),
-                    Text = text
-                });
-            }
-
-            CompleteLineEndTimes(result);
-            return result;
-        }
-
-        private static List<LyricLineItem> ParseTtml(string? content)
-        {
-            var result = new List<LyricLineItem>();
-            if (string.IsNullOrWhiteSpace(content))
-            {
-                return result;
-            }
-
-            foreach (Match match in TtmlLineRegex.Matches(content))
-            {
-                var text = DecodeXmlText(XmlTagRegex.Replace(match.Groups[4].Value, string.Empty)).Trim();
-                if (string.IsNullOrWhiteSpace(text) || !TryParseTtmlTime(match.Groups[1].Value, out var start))
-                {
-                    continue;
-                }
-
-                TimeSpan end;
-                if (match.Groups[2].Success && TryParseTtmlTime(match.Groups[2].Value, out var explicitEnd))
-                {
-                    end = explicitEnd;
-                }
-                else if (match.Groups[3].Success && TryParseTtmlTime(match.Groups[3].Value, out var duration))
-                {
-                    end = start + duration;
-                }
-                else
-                {
-                    end = start + TimeSpan.FromSeconds(5);
-                }
-
-                result.Add(new LyricLineItem { Start = start, End = end, Text = text });
-            }
-
-            CompleteLineEndTimes(result);
-            return result;
-        }
-
-        private static TimeSpan ParseLrcTimestamp(Match match)
-        {
-            var minutes = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
-            var seconds = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
-            var millisecondsText = match.Groups[3].Success ? match.Groups[3].Value : "0";
-            var normalizedMilliseconds = millisecondsText.PadRight(3, '0')[..3];
-            var milliseconds = int.Parse(normalizedMilliseconds, CultureInfo.InvariantCulture);
-            return TimeSpan.FromMilliseconds(minutes * 60_000 + seconds * 1_000 + milliseconds);
-        }
-
-        private static TimeSpan ParseEnhancedTimestamp(Match match)
-        {
-            var minutes = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
-            var seconds = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
-            var millisecondsText = match.Groups[3].Success ? match.Groups[3].Value : "0";
-            var normalizedMilliseconds = millisecondsText.PadRight(3, '0')[..3];
-            var milliseconds = int.Parse(normalizedMilliseconds, CultureInfo.InvariantCulture);
-            return TimeSpan.FromMilliseconds(minutes * 60_000 + seconds * 1_000 + milliseconds);
-        }
-
-        private static void CompleteLineEndTimes(List<LyricLineItem> lines)
-        {
-            lines.Sort((a, b) => a.Start.CompareTo(b.Start));
-            for (var i = 0; i < lines.Count; i++)
-            {
-                var nextLine = i + 1 < lines.Count ? lines[i + 1] : null;
-                if (nextLine != null && (lines[i].End <= lines[i].Start || lines[i].End > nextLine.Start))
-                {
-                    lines[i].End = nextLine.Start;
-                }
-                else if (lines[i].End <= lines[i].Start)
-                {
-                    lines[i].End = lines[i].Start + TimeSpan.FromSeconds(5);
-                }
-            }
-        }
-
-        private static string? ExtractQrcLyricContent(string rawContent)
-        {
-            var match = Regex.Match(rawContent, "LyricContent=\"([\\s\\S]*?)\"", RegexOptions.IgnoreCase);
-            if (!match.Success)
-            {
-                return null;
-            }
-
-            return DecodeXmlText(match.Groups[1].Value)
-                .Replace("\\n", "\n")
-                .Replace("\\r", "\r");
-        }
-
-        private static bool TryParseTtmlTime(string value, out TimeSpan time)
-        {
-            value = value.Trim();
-            if (value.EndsWith("ms", StringComparison.OrdinalIgnoreCase) &&
-                double.TryParse(value[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out var milliseconds))
-            {
-                time = TimeSpan.FromMilliseconds(milliseconds);
-                return true;
-            }
-
-            if (value.EndsWith("s", StringComparison.OrdinalIgnoreCase) &&
-                double.TryParse(value[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds))
-            {
-                time = TimeSpan.FromSeconds(seconds);
-                return true;
-            }
-
-            var parts = value.Split(':');
-            if (parts.Length is 1 or 2 or 3)
-            {
-                if (TryParseClockPart(parts[0], out var first) &&
-                    TryParseClockPart(parts.Length > 1 ? parts[1] : "0", out var second) &&
-                    TryParseClockPart(parts.Length > 2 ? parts[2] : "0", out var third))
-                {
-                    time = parts.Length switch
-                    {
-                        3 => TimeSpan.FromHours(first) + TimeSpan.FromMinutes(second) + TimeSpan.FromSeconds(third),
-                        2 => TimeSpan.FromMinutes(first) + TimeSpan.FromSeconds(second),
-                        _ => TimeSpan.FromSeconds(first)
-                    };
-                    return true;
-                }
-            }
-
-            time = TimeSpan.Zero;
-            return false;
-        }
-
-        private static bool TryParseClockPart(string value, out double parsed)
-        {
-            return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed);
-        }
-
-        private static string DecodeXmlText(string value)
-        {
-            return value
-                .Replace("&quot;", "\"")
-                .Replace("&apos;", "'")
-                .Replace("&lt;", "<")
-                .Replace("&gt;", ">")
-                .Replace("&amp;", "&");
-        }
-
-        private static void AlignTranslations(List<LyricLineItem> lyrics, IReadOnlyList<LyricLineItem> translations)
-        {
-            var i = 0;
-            var j = 0;
-            var tolerance = TimeSpan.FromMilliseconds(300);
-
-            while (i < lyrics.Count && j < translations.Count)
-            {
-                var diff = lyrics[i].Start - translations[j].Start;
-                if (diff.Duration() <= tolerance)
-                {
-                    lyrics[i].Translation = translations[j].Text;
-                    i++;
-                    j++;
-                }
-                else if (diff < TimeSpan.Zero)
-                {
-                    i++;
-                }
-                else
-                {
-                    j++;
-                }
-            }
-        }
-
-        private static TimeSpan GetEstimatedDuration(IReadOnlyList<LyricLineItem> lyrics, TimeSpan fallback)
-        {
-            if (lyrics.Count == 0)
-            {
-                return fallback;
-            }
-
-            var lastLineEnd = lyrics.Max(line => line.End);
-            return lastLineEnd > TimeSpan.FromSeconds(30) ? lastLineEnd + TimeSpan.FromSeconds(3) : fallback;
-        }
+        private sealed record CurrentPlaybackFrame(ScheduledSongPlayback Entry, TimeSpan Position);
 
         private void UpdateLyricDisplay()
         {
@@ -2219,10 +1933,27 @@ namespace VoiceHubComponent
                 return;
             }
 
-            ContentText = Settings.EnableLyrics ? GetLyricDisplayText(DateTime.Now) : _scheduleSummaryText;
+            if (!Settings.EnableLyrics)
+            {
+                ShowSummary();
+                return;
+            }
+
+            var frame = ResolveCurrentPlayback(DateTime.Now);
+            if (frame == null)
+            {
+                ShowSummary();
+                return;
+            }
+
+            UpdateNowPlaying(frame.Entry);
+            UpdatePresenterFrame(frame.Entry, frame.Position);
         }
 
-        private string GetLyricDisplayText(DateTime now)
+        /// <summary>
+        /// 按排期与时长估算当前正在播放的歌曲与进度，未处于播放状态返回 null
+        /// </summary>
+        private CurrentPlaybackFrame? ResolveCurrentPlayback(DateTime now)
         {
             List<ScheduledSongPlayback> plan;
             DateTime playbackDate;
@@ -2234,7 +1965,7 @@ namespace VoiceHubComponent
 
             if (plan.Count == 0 || playbackDate == DateTime.MinValue)
             {
-                return _scheduleSummaryText;
+                return null;
             }
 
             var startTime = ResolveBroadcastStartTime(plan);
@@ -2242,7 +1973,7 @@ namespace VoiceHubComponent
             var firstSongStart = displayDate + startTime;
             if (now < firstSongStart)
             {
-                return _scheduleSummaryText;
+                return null;
             }
 
             var elapsed = now - firstSongStart;
@@ -2252,20 +1983,20 @@ namespace VoiceHubComponent
             {
                 if (!entry.HasReliableDuration)
                 {
-                    return _scheduleSummaryText;
+                    return null;
                 }
 
                 var start = cursor;
                 var end = cursor + entry.Duration;
                 if (elapsed >= start && elapsed < end)
                 {
-                    return BuildCurrentLyricText(entry, elapsed - start);
+                    return new CurrentPlaybackFrame(entry, elapsed - start);
                 }
 
                 cursor = end;
             }
 
-            return _scheduleSummaryText;
+            return null;
         }
 
         private TimeSpan ResolveBroadcastStartTime(IReadOnlyList<ScheduledSongPlayback> plan)
@@ -2300,42 +2031,315 @@ namespace VoiceHubComponent
             return false;
         }
 
-        private string BuildCurrentLyricText(ScheduledSongPlayback entry, TimeSpan songPosition)
+        private void ShowSummary()
         {
+            NowPlayingPanel.IsVisible = false;
+            LyricsPresenter.IsVisible = false;
+            SummaryText.IsVisible = true;
+            ContentText = _scheduleSummaryText;
+            _currentPlaybackKey = null;
+            _lyricTimer.Interval = TimeSpan.FromSeconds(1);
+        }
+
+        private void UpdateNowPlaying(ScheduledSongPlayback entry)
+        {
+            var key = $"{entry.Item.Id}:{GetSongCacheKey(entry.Item.Song)}";
+            NowPlayingPanel.IsVisible = true;
+            SummaryText.IsVisible = false;
+            if (_currentPlaybackKey == key)
+            {
+                return;
+            }
+
+            _currentPlaybackKey = key;
             var song = entry.Item.Song;
-            var prefix = $"♪ #{entry.Item.Sequence} {song.Artist} - {song.Title}";
+            NowPlayingTitle.Text = $"#{entry.Item.Sequence} {song.Title}";
+            var artistParts = new List<string>();
+            if (song.IsReplay)
+            {
+                artistParts.Add("重播");
+            }
+
+            if (!string.IsNullOrWhiteSpace(song.Artist))
+            {
+                artistParts.Add(song.Artist);
+            }
+
+            if (!string.IsNullOrWhiteSpace(song.Requester) && !ShouldHideRequester(song.Requester))
+            {
+                artistParts.Add($"点歌：{song.Requester}");
+            }
+
+            NowPlayingArtist.Text = string.Join(" · ", artistParts);
+            _ = LoadCoverForSongAsync(song.Cover, key);
+        }
+
+        private void UpdatePresenterFrame(ScheduledSongPlayback entry, TimeSpan position)
+        {
+            LyricsPresenter.IsVisible = true;
+            SummaryText.IsVisible = false;
+
+            LyricsPresenter.ShowTranslation = Settings.ShowTranslation;
+            LyricsPresenter.ShowRomanization = Settings.ShowRomanization;
+            LyricsPresenter.WordByWord = Settings.WordByWord;
+
+            if (string.Equals(entry.LyricStatus, "loading", StringComparison.OrdinalIgnoreCase))
+            {
+                LyricsPresenter.ShowStatus("歌词加载中…", $"loading:{entry.Item.Id}");
+                _lyricTimer.Interval = TimeSpan.FromSeconds(1);
+                return;
+            }
 
             if (entry.Lyrics.Count == 0)
             {
-                return entry.LyricStatus == "loading"
-                    ? $"{prefix} | 歌词加载中"
-                    : $"{prefix} | 暂无歌词{BuildDurationStatusSuffix(entry)}";
+                LyricsPresenter.ShowStatus("暂无歌词", $"none:{entry.Item.Id}");
+                _lyricTimer.Interval = TimeSpan.FromSeconds(1);
+                return;
             }
 
-            var currentLine = entry.Lyrics.LastOrDefault(line => songPosition >= line.Start);
-            if (currentLine == null)
-            {
-                return $"{prefix} | 前奏";
-            }
-
-            var lyricText = currentLine.Text;
-            if (!string.IsNullOrWhiteSpace(currentLine.Translation))
-            {
-                lyricText += $" / {currentLine.Translation}";
-            }
-
-            return $"{prefix} | {lyricText}{BuildDurationStatusSuffix(entry)}";
+            var positionMs = position.TotalMilliseconds;
+            LyricsPresenter.ShowLines(entry.Lyrics, entry.LyricFormat, positionMs);
+            _lyricTimer.Interval = LyricsPresenter.GetNextRefreshDelay(entry.Lyrics, positionMs);
         }
 
-        private static string BuildDurationStatusSuffix(ScheduledSongPlayback entry)
+        // ========== 封面显示 ==========
+
+        private async Task LoadCoverForSongAsync(string? coverUrl, string playbackKey)
         {
-            return entry.DurationSource == "fallback" ? "（时长估算）" : string.Empty;
+            var showCover = Settings.ShowCover;
+            CoverContainer.IsVisible = showCover;
+            if (!showCover)
+            {
+                return;
+            }
+
+            Bitmap? bitmap = null;
+            var coverKey = string.Empty;
+            if (!string.IsNullOrWhiteSpace(coverUrl))
+            {
+                var resolvedUrl = ResolveCoverUrl(coverUrl.Trim());
+                if (resolvedUrl != null)
+                {
+                    coverKey = ComputeMd5Hex(resolvedUrl.AbsoluteUri);
+                    try
+                    {
+                        bitmap = await LoadCoverBitmapAsync(resolvedUrl, coverKey);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogDebug(ex, "VoiceHub 封面加载失败：url={CoverUrl}", resolvedUrl);
+                    }
+                }
+            }
+
+            if (_currentPlaybackKey != playbackKey)
+            {
+                return;
+            }
+
+            SetCover(bitmap, coverKey);
+        }
+
+        /// <summary>
+        /// 点歌人为超级管理员时隐藏
+        /// </summary>
+        private static bool ShouldHideRequester(string? requester) =>
+            string.Equals(requester?.Trim(), HiddenRequesterName, StringComparison.Ordinal);
+
+        private Uri? ResolveCoverUrl(string coverUrl)
+        {
+            if (Uri.TryCreate(coverUrl, UriKind.Absolute, out var absolute))
+            {
+                return absolute.Scheme == Uri.UriSchemeHttp || absolute.Scheme == Uri.UriSchemeHttps ? absolute : null;
+            }
+
+            var origin = GetVoiceHubOrigin();
+            if (origin != null && Uri.TryCreate(origin, coverUrl.StartsWith('/') ? coverUrl : "/" + coverUrl, out var resolved))
+            {
+                return resolved;
+            }
+
+            return null;
+        }
+
+        private async Task<Bitmap?> LoadCoverBitmapAsync(Uri url, string coverKey)
+        {
+            lock (_coverBitmapCache)
+            {
+                if (_coverBitmapCache.TryGetValue(coverKey, out var cached))
+                {
+                    return cached;
+                }
+            }
+
+            var coversDirectory = Path.Combine(CacheDirectory, "covers");
+            var path = Path.Combine(coversDirectory, $"cover-{coverKey}.img");
+            Bitmap? bitmap = null;
+            try
+            {
+                if (File.Exists(path))
+                {
+                    await using var fileStream = File.OpenRead(path);
+                    bitmap = Bitmap.DecodeToHeight(fileStream, 256);
+                }
+            }
+            catch
+            {
+                // 缓存文件损坏时重新下载。
+            }
+
+            if (bitmap == null)
+            {
+                var bytes = await DownloadCoverBytesAsync(url);
+                if (bytes.Length == 0 || bytes.Length > 2 * 1024 * 1024)
+                {
+                    return null;
+                }
+
+                try
+                {
+                    Directory.CreateDirectory(coversDirectory);
+                    File.WriteAllBytes(path, bytes);
+                }
+                catch
+                {
+                    // 封面缓存写入失败不影响显示。
+                }
+
+                await using var memoryStream = new MemoryStream(bytes);
+                bitmap = Bitmap.DecodeToHeight(memoryStream, 256);
+            }
+
+            lock (_coverBitmapCache)
+            {
+                if (_coverBitmapCache.Count > 12)
+                {
+                    _coverBitmapCache.Clear();
+                }
+
+                _coverBitmapCache[coverKey] = bitmap;
+            }
+
+            return bitmap;
+        }
+
+        /// <summary>
+        /// 下载封面字节。首次使用 VoiceHub 同源请求头，失败后带浏览器 UA 与音乐站点 Referer 重试，规避 CDN 防盗链。
+        /// </summary>
+        private async Task<byte[]> DownloadCoverBytesAsync(Uri url)
+        {
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                try
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                    if (attempt == 0)
+                    {
+                        AddVoiceHubSameOriginHeaders(request, url);
+                    }
+                    else
+                    {
+                        request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+                        request.Headers.TryAddWithoutValidation("Referer", $"{url.Scheme}://{url.Host}/");
+                    }
+
+                    using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                    response.EnsureSuccessStatusCode();
+                    if (response.Content.Headers.ContentLength is > 2 * 1024 * 1024)
+                    {
+                        return Array.Empty<byte>();
+                    }
+
+                    return await response.Content.ReadAsByteArrayAsync();
+                }
+                catch (Exception ex) when (attempt == 0)
+                {
+                    _logger?.LogWarning(ex, "VoiceHub 封面下载失败，尝试携带浏览器请求头重试：url={CoverUrl}", url);
+                }
+            }
+
+            return Array.Empty<byte>();
+        }
+
+        private void SetCover(Bitmap? cover, string coverKey)
+        {
+            if (_displayedCoverKey == coverKey && ReferenceEquals(_displayedCover, cover))
+            {
+                return;
+            }
+
+            _displayedCover = cover;
+            _displayedCoverKey = coverKey;
+            CoverPlaceholder.IsVisible = cover == null;
+            StopCoverTransition();
+            var oldImage = FrontCoverImage;
+            var newImage = BackCoverImage;
+            newImage.Source = cover;
+            newImage.Opacity = cover == null ? 0 : 1;
+            oldImage.Opacity = oldImage.Source == null ? 0 : 1;
+            FrontCoverImage = newImage;
+            BackCoverImage = oldImage;
+            var cancellation = new CancellationTokenSource();
+            _coverTransitionCancellation = cancellation;
+            _ = RunCoverTransitionAsync(oldImage, newImage, cancellation);
+        }
+
+        private async Task RunCoverTransitionAsync(
+            Image oldImage,
+            Image newImage,
+            CancellationTokenSource cancellation)
+        {
+            try
+            {
+                await Task.WhenAll(
+                    CreateOpacityAnimation(oldImage.Opacity, 0).RunAsync(oldImage, cancellation.Token),
+                    CreateOpacityAnimation(0, newImage.Source == null ? 0 : 1).RunAsync(newImage, cancellation.Token));
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                if (ReferenceEquals(_coverTransitionCancellation, cancellation))
+                {
+                    _coverTransitionCancellation = null;
+                    oldImage.Source = null;
+                    oldImage.Opacity = 0;
+                    newImage.Opacity = newImage.Source == null ? 0 : 1;
+                }
+
+                cancellation.Dispose();
+            }
+        }
+
+        private static Animation CreateOpacityAnimation(double from, double to) => new()
+        {
+            Duration = CoverTransitionDuration,
+            Easing = new CubicEaseOut(),
+            FillMode = FillMode.None,
+            Children =
+            {
+                new KeyFrame { Cue = new Cue(0), Setters = { new Setter(Visual.OpacityProperty, from) } },
+                new KeyFrame { Cue = new Cue(1), Setters = { new Setter(Visual.OpacityProperty, to) } }
+            }
+        };
+
+        private void StopCoverTransition(bool settle = false)
+        {
+            var cancellation = _coverTransitionCancellation;
+            _coverTransitionCancellation = null;
+            cancellation?.Cancel();
+            if (!settle) return;
+            FrontCoverImage.Source = _displayedCover;
+            FrontCoverImage.Opacity = _displayedCover == null ? 0 : 1;
+            BackCoverImage.Source = null;
+            BackCoverImage.Opacity = 0;
         }
 
         private void SetState(ComponentState state, string? message = null)
         {
             _currentState = state;
-            
+
             // 更新守护定时器
             if (state == ComponentState.Loading)
                 _loadingGuardTimer.Start();
@@ -2370,108 +2374,16 @@ namespace VoiceHubComponent
             }
         }
 
-        private sealed record LyricPayload(string? Lrc, string? Translation, string? Yrc, string? Ttml)
-        {
-            public static LyricPayload Empty { get; } = new(null, null, null, null);
-        }
-
         private sealed record ResolvedPlayback(
             TimeSpan Duration,
             string DurationSource,
             List<LyricLineItem> Lyrics,
-            string LyricStatus);
+            string LyricStatus,
+            string LyricFormat);
 
         private sealed record DurationProbe(TimeSpan Duration, string Source)
         {
             public static readonly DurationProbe Empty = new(TimeSpan.Zero, string.Empty);
-        }
-
-        private sealed class DailyLyricCache
-        {
-            public int Version { get; set; } = LyricCacheVersion;
-            public string Date { get; set; } = string.Empty;
-            public string ScheduleSignature { get; set; } = string.Empty;
-            public bool HasNeteaseCookie { get; set; }
-            public string NeteaseCookieFingerprint { get; set; } = string.Empty;
-            public Dictionary<string, CacheEntry> Entries { get; set; } = new(StringComparer.OrdinalIgnoreCase);
-        }
-
-        private sealed class CacheEntry
-        {
-            public string CacheKey { get; set; } = string.Empty;
-            public string Title { get; set; } = string.Empty;
-            public string Artist { get; set; } = string.Empty;
-            public double DurationMs { get; set; }
-            public string DurationSource { get; set; } = "fallback";
-            public string LyricStatus { get; set; } = "no-lyrics";
-            public DateTime UpdatedAt { get; set; } = DateTime.Now;
-            public List<CachedLyricLine> Lyrics { get; set; } = new();
-
-            public bool IsUsable()
-            {
-                return DurationMs > 0 && Lyrics.Count > 0 && !string.Equals(LyricStatus, "no-lyrics", StringComparison.OrdinalIgnoreCase);
-            }
-
-            public static CacheEntry FromPlayback(string cacheKey, ScheduledSongPlayback playback)
-            {
-                return new CacheEntry
-                {
-                    CacheKey = cacheKey,
-                    Title = playback.Item.Song.Title,
-                    Artist = playback.Item.Song.Artist,
-                    DurationMs = playback.Duration.TotalMilliseconds,
-                    DurationSource = playback.DurationSource,
-                    LyricStatus = playback.LyricStatus,
-                    UpdatedAt = DateTime.Now,
-                    Lyrics = playback.Lyrics.Select(CachedLyricLine.FromLyricLineItem).ToList()
-                };
-            }
-        }
-
-        private sealed class CachedLyricLine
-        {
-            public double StartMs { get; set; }
-            public double EndMs { get; set; }
-            public string Text { get; set; } = string.Empty;
-            public string? Translation { get; set; }
-
-            public static CachedLyricLine FromLyricLineItem(LyricLineItem line)
-            {
-                return new CachedLyricLine
-                {
-                    StartMs = line.Start.TotalMilliseconds,
-                    EndMs = line.End.TotalMilliseconds,
-                    Text = line.Text,
-                    Translation = line.Translation
-                };
-            }
-
-            public LyricLineItem ToLyricLineItem()
-            {
-                return new LyricLineItem
-                {
-                    Start = TimeSpan.FromMilliseconds(StartMs),
-                    End = TimeSpan.FromMilliseconds(EndMs),
-                    Text = Text,
-                    Translation = Translation
-                };
-            }
-        }
-
-        private sealed class ScheduledSongPlayback
-        {
-            public ScheduledSongPlayback(SongItem item, TimeSpan duration)
-            {
-                Item = item;
-                Duration = duration;
-            }
-
-            public SongItem Item { get; }
-            public TimeSpan Duration { get; set; }
-            public List<LyricLineItem> Lyrics { get; set; } = new();
-            public string DurationSource { get; set; } = "fallback";
-            public string LyricStatus { get; set; } = "loading";
-            public bool HasReliableDuration => Duration > TimeSpan.Zero && DurationSource != "unresolved";
         }
 
         private enum ComponentState

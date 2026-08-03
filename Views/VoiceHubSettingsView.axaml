@@ -1,4 +1,4 @@
-<ci:ComponentBase x:Class="VoiceHubComponent.Views.VoiceHubSettingsView"
+﻿<ci:ComponentBase x:Class="VoiceHubComponent.Views.VoiceHubSettingsView"
                 x:TypeArguments="models:VoiceHubSettings"
                 x:DataType="models:VoiceHubSettings"
                 xmlns="https://github.com/avaloniaui"
@@ -8,7 +8,7 @@
                 xmlns:models="clr-namespace:VoiceHubComponent.Models">
     <ScrollViewer>
         <StackPanel Margin="16" Spacing="8">
-            <TextBlock Text="VoiceHub 插件设置" 
+            <TextBlock Text="VoiceHub 插件设置"
                        FontSize="20"
                        FontWeight="SemiBold"
                        Margin="0,0,0,16"/>
@@ -24,19 +24,55 @@
                              VerticalAlignment="Center"/>
                 </fluent:SettingsExpander.Footer>
             </fluent:SettingsExpander>
-            
+
             <TextBlock Text="默认: https://voicehub.lao-shui.top/api/songs/public"
                        FontSize="12"
                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                        Margin="16,0,0,0"/>
 
             <fluent:SettingsExpander Header="歌词显示"
-                                     Description="按排期顺序和固定开始时间，在组件上显示当前歌词行。"
+                                     Description="按排期顺序和固定开始时间，在组件上显示当前歌词。"
                                      IconSource="{ci:FluentIconSource &#xE3E3;}">
                 <fluent:SettingsExpander.Footer>
                     <CheckBox x:Name="EnableLyricsCheckBox"
                               IsChecked="{Binding EnableLyrics}"
                               Content="启用歌词显示"
+                              VerticalAlignment="Center"/>
+                </fluent:SettingsExpander.Footer>
+            </fluent:SettingsExpander>
+
+            <fluent:SettingsExpander Header="显示效果"
+                                     Description="左侧显示封面与歌曲信息，歌词支持逐字高亮、翻译与罗马音。"
+                                     IconSource="{ci:FluentIconSource &#xE8D6;}">
+                <fluent:SettingsExpander.Footer>
+                    <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                        <CheckBox x:Name="ShowCoverCheckBox"
+                                  IsChecked="{Binding ShowCover}"
+                                  Content="显示封面"
+                                  VerticalAlignment="Center"/>
+                        <CheckBox x:Name="WordByWordCheckBox"
+                                  IsChecked="{Binding WordByWord}"
+                                  Content="逐字歌词"
+                                  VerticalAlignment="Center"/>
+                        <CheckBox x:Name="ShowTranslationCheckBox"
+                                  IsChecked="{Binding ShowTranslation}"
+                                  Content="显示翻译"
+                                  VerticalAlignment="Center"/>
+                        <CheckBox x:Name="ShowRomanizationCheckBox"
+                                  IsChecked="{Binding ShowRomanization}"
+                                  Content="显示罗马音"
+                                  VerticalAlignment="Center"/>
+                    </StackPanel>
+                </fluent:SettingsExpander.Footer>
+            </fluent:SettingsExpander>
+
+            <fluent:SettingsExpander Header="歌词升级"
+                                     Description="本侧歌词非最高阶格式时，跨平台搜索 TTML/逐字歌词。仅在开启逐字歌词时生效。"
+                                     IconSource="{ci:FluentIconSource &#xEBC9;}">
+                <fluent:SettingsExpander.Footer>
+                    <CheckBox x:Name="EnableLyricUpgradeCheckBox"
+                              IsChecked="{Binding EnableLyricUpgrade}"
+                              Content="启用跨平台歌词升级"
                               VerticalAlignment="Center"/>
                 </fluent:SettingsExpander.Footer>
             </fluent:SettingsExpander>
@@ -88,7 +124,7 @@
                         Content="保存配置"
                         Classes="accent"
                         Click="SaveButton_Click"/>
-                
+
                 <Button x:Name="RefreshButton"
                         Content="刷新组件"
                         Click="RefreshButton_Click"/>
@@ -100,7 +136,7 @@
                 <Button x:Name="TestConnectionButton"
                         Content="测试连接"
                         Click="TestConnectionButton_Click"/>
-                
+
                 <Button x:Name="ResetButton"
                         Content="重置为默认"
                         Click="ResetButton_Click"/>

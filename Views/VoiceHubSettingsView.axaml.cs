@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Globalization;
 using System.Net.Http;
 using System.Threading.Tasks;
@@ -29,24 +29,11 @@ namespace VoiceHubComponent.Views
 
         private void SaveButton_Click(object sender, RoutedEventArgs e)
         {
-            var apiUrl = ApiUrlTextBox.Text?.Trim();
-            if (string.IsNullOrEmpty(apiUrl))
-            {
-                this.ShowWarningToast("请输入API地址");
-                return;
-            }
-
-            if (!TryReadLyricsSettings(out var startTime))
+            if (!TryApplySettingsFromInputs())
             {
                 return;
             }
 
-            Settings.ApiUrl = apiUrl;
-            Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
-            Settings.BroadcastStartTime = startTime;
-            Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
-            Settings.UseDebugScheduleDate = UseDebugScheduleDateCheckBox.IsChecked == true;
-            Settings.DebugScheduleDate = DebugScheduleDatePicker.SelectedDate ?? DateTime.Today;
             this.ShowSuccessToast("配置已保存");
         }
 
@@ -60,24 +47,11 @@ namespace VoiceHubComponent.Views
 
             try
             {
-                var apiUrl = ApiUrlTextBox.Text?.Trim();
-                if (string.IsNullOrEmpty(apiUrl))
-                {
-                    this.ShowWarningToast("请输入API地址");
-                    return;
-                }
-
-                if (!TryReadLyricsSettings(out var startTime))
+                if (!TryApplySettingsFromInputs())
                 {
                     return;
                 }
 
-                Settings.ApiUrl = apiUrl;
-                Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
-                Settings.BroadcastStartTime = startTime;
-                Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
-                Settings.UseDebugScheduleDate = UseDebugScheduleDateCheckBox.IsChecked == true;
-                Settings.DebugScheduleDate = DebugScheduleDatePicker.SelectedDate ?? DateTime.Today;
                 VoiceHubControl.ClearLyricCache();
                 await VoiceHubControl.RequestManualRefreshAsync();
                 this.ShowSuccessToast("配置已生效，组件已刷新");
@@ -103,24 +77,11 @@ namespace VoiceHubComponent.Views
 
             try
             {
-                var apiUrl = ApiUrlTextBox.Text?.Trim();
-                if (string.IsNullOrEmpty(apiUrl))
-                {
-                    this.ShowWarningToast("请输入API地址");
-                    return;
-                }
-
-                if (!TryReadLyricsSettings(out var startTime))
+                if (!TryApplySettingsFromInputs())
                 {
                     return;
                 }
 
-                Settings.ApiUrl = apiUrl;
-                Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
-                Settings.BroadcastStartTime = startTime;
-                Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
-                Settings.UseDebugScheduleDate = UseDebugScheduleDateCheckBox.IsChecked == true;
-                Settings.DebugScheduleDate = DebugScheduleDatePicker.SelectedDate ?? DateTime.Today;
                 VoiceHubControl.ClearLyricCache();
                 await VoiceHubControl.RequestManualRefreshAsync();
                 this.ShowSuccessToast("歌词缓存已清除，正在重新获取");
@@ -156,7 +117,7 @@ namespace VoiceHubComponent.Views
                 // 设置超时时间
                 using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(10));
                 var response = await _httpClient.GetAsync(apiUrl, cts.Token);
-                
+
                 if (response.IsSuccessStatusCode)
                 {
                     var content = await response.Content.ReadAsStringAsync();
@@ -201,18 +162,38 @@ namespace VoiceHubComponent.Views
             Settings.NeteaseCookie = string.Empty;
             Settings.UseDebugScheduleDate = false;
             Settings.DebugScheduleDate = DateTime.Today;
+            Settings.ShowCover = true;
+            Settings.ShowTranslation = true;
+            Settings.ShowRomanization = false;
+            Settings.WordByWord = true;
+            Settings.EnableLyricUpgrade = true;
             ApiUrlTextBox.Text = DefaultApiUrl;
             EnableLyricsCheckBox.IsChecked = false;
             BroadcastStartTimeTextBox.Text = "12:20:00";
             NeteaseCookieTextBox.Text = string.Empty;
             UseDebugScheduleDateCheckBox.IsChecked = false;
             DebugScheduleDatePicker.SelectedDate = DateTime.Today;
-            this.ShowSuccessToast("已重置为默认API地址");
+            ShowCoverCheckBox.IsChecked = true;
+            ShowTranslationCheckBox.IsChecked = true;
+            ShowRomanizationCheckBox.IsChecked = false;
+            WordByWordCheckBox.IsChecked = true;
+            EnableLyricUpgradeCheckBox.IsChecked = true;
+            this.ShowSuccessToast("已重置为默认配置");
         }
 
-        private bool TryReadLyricsSettings(out string startTime)
+        /// <summary>
+        /// 校验输入并把全部设置写回 Settings
+        /// </summary>
+        private bool TryApplySettingsFromInputs()
         {
-            startTime = BroadcastStartTimeTextBox.Text?.Trim() ?? string.Empty;
+            var apiUrl = ApiUrlTextBox.Text?.Trim();
+            if (string.IsNullOrEmpty(apiUrl))
+            {
+                this.ShowWarningToast("请输入API地址");
+                return false;
+            }
+
+            var startTime = BroadcastStartTimeTextBox.Text?.Trim() ?? string.Empty;
             if (!TimeSpan.TryParseExact(
                     startTime,
                     new[] { @"hh\:mm", @"h\:mm", @"hh\:mm\:ss", @"h\:mm\:ss" },
@@ -223,6 +204,17 @@ namespace VoiceHubComponent.Views
                 return false;
             }
 
+            Settings.ApiUrl = apiUrl;
+            Settings.EnableLyrics = EnableLyricsCheckBox.IsChecked == true;
+            Settings.BroadcastStartTime = startTime;
+            Settings.NeteaseCookie = NeteaseCookieTextBox.Text?.Trim() ?? string.Empty;
+            Settings.UseDebugScheduleDate = UseDebugScheduleDateCheckBox.IsChecked == true;
+            Settings.DebugScheduleDate = DebugScheduleDatePicker.SelectedDate ?? DateTime.Today;
+            Settings.ShowCover = ShowCoverCheckBox.IsChecked == true;
+            Settings.ShowTranslation = ShowTranslationCheckBox.IsChecked == true;
+            Settings.ShowRomanization = ShowRomanizationCheckBox.IsChecked == true;
+            Settings.WordByWord = WordByWordCheckBox.IsChecked == true;
+            Settings.EnableLyricUpgrade = EnableLyricUpgradeCheckBox.IsChecked == true;
             return true;
         }
     }

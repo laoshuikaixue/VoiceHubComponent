@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
@@ -9,25 +9,24 @@
     <AssemblyName>VoiceHubComponent</AssemblyName>
     <RootNamespace>VoiceHubComponent</RootNamespace>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
-    
+    <ClassIslandPluginSdkVersion>2.0.0.1</ClassIslandPluginSdkVersion>
+
     <!-- 插件发布配置 -->
     <PublishSingleFile>false</PublishSingleFile>
     <SelfContained>false</SelfContained>
     <PublishReadyToRun>false</PublishReadyToRun>
     <PublishTrimmed>false</PublishTrimmed>
-    
+
     <!-- 优化包大小 -->
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="ClassIsland.PluginSdk" Version="1.7.105.1-dev-v2">
+    <PackageReference Include="ClassIsland.PluginSdk" Version="$(ClassIslandPluginSdkVersion)">
       <ExcludeAssets>runtime; native</ExcludeAssets>
     </PackageReference>
   </ItemGroup>
-
-  <Import Project="..\ClassIsland.PluginSdk\ClassIsland.PluginSdk.targets" />
 
   <ItemGroup>
     <None Update="icon.png">

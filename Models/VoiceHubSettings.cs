@@ -1,3 +1,4 @@
+﻿using System;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -17,6 +18,11 @@ namespace VoiceHubComponent.Models
         private string _neteaseCookie = string.Empty;
         private bool _useDebugScheduleDate = false;
         private DateTime _debugScheduleDate = DateTime.Today;
+        private bool _showCover = true;
+        private bool _showTranslation = true;
+        private bool _showRomanization = false;
+        private bool _wordByWord = true;
+        private bool _enableLyricUpgrade = true;
         private bool _isLoaded = false;
         private static readonly string SettingsPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -27,7 +33,7 @@ namespace VoiceHubComponent.Models
         /// </summary>
         public string ApiUrl
         {
-            get 
+            get
             {
                 EnsureLoaded();
                 return _apiUrl;
@@ -157,6 +163,116 @@ namespace VoiceHubComponent.Models
             }
         }
 
+        /// <summary>
+        /// 是否显示歌曲封面。
+        /// </summary>
+        public bool ShowCover
+        {
+            get
+            {
+                EnsureLoaded();
+                return _showCover;
+            }
+            set
+            {
+                EnsureLoaded();
+                if (_showCover != value)
+                {
+                    _showCover = value;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 是否显示歌词翻译。
+        /// </summary>
+        public bool ShowTranslation
+        {
+            get
+            {
+                EnsureLoaded();
+                return _showTranslation;
+            }
+            set
+            {
+                EnsureLoaded();
+                if (_showTranslation != value)
+                {
+                    _showTranslation = value;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 是否显示歌词罗马音。
+        /// </summary>
+        public bool ShowRomanization
+        {
+            get
+            {
+                EnsureLoaded();
+                return _showRomanization;
+            }
+            set
+            {
+                EnsureLoaded();
+                if (_showRomanization != value)
+                {
+                    _showRomanization = value;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 是否启用逐字歌词高亮。关闭后不发送歌词升级请求。
+        /// </summary>
+        public bool WordByWord
+        {
+            get
+            {
+                EnsureLoaded();
+                return _wordByWord;
+            }
+            set
+            {
+                EnsureLoaded();
+                if (_wordByWord != value)
+                {
+                    _wordByWord = value;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 是否启用跨平台歌词升级（TTML/逐字）。仅在逐字歌词开启时生效。
+        /// </summary>
+        public bool EnableLyricUpgrade
+        {
+            get
+            {
+                EnsureLoaded();
+                return _enableLyricUpgrade;
+            }
+            set
+            {
+                EnsureLoaded();
+                if (_enableLyricUpgrade != value)
+                {
+                    _enableLyricUpgrade = value;
+                    OnPropertyChanged();
+                    SaveSettings();
+                }
+            }
+        }
+
         public event PropertyChangedEventHandler? PropertyChanged;
 
         public VoiceHubSettings()
@@ -186,7 +302,7 @@ namespace VoiceHubComponent.Models
                 {
                     var jsonString = File.ReadAllText(SettingsPath);
                     var jsonDocument = JsonDocument.Parse(jsonString);
-                    
+
                     if (jsonDocument.RootElement.TryGetProperty("ApiUrl", out var apiUrlElement))
                     {
                         var apiUrl = apiUrlElement.GetString();
@@ -227,6 +343,31 @@ namespace VoiceHubComponent.Models
                         {
                             _debugScheduleDate = debugScheduleDate.Date;
                         }
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("ShowCover", out var showCoverElement))
+                    {
+                        _showCover = showCoverElement.GetBoolean();
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("ShowTranslation", out var showTranslationElement))
+                    {
+                        _showTranslation = showTranslationElement.GetBoolean();
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("ShowRomanization", out var showRomanizationElement))
+                    {
+                        _showRomanization = showRomanizationElement.GetBoolean();
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("WordByWord", out var wordByWordElement))
+                    {
+                        _wordByWord = wordByWordElement.GetBoolean();
+                    }
+
+                    if (jsonDocument.RootElement.TryGetProperty("EnableLyricUpgrade", out var enableLyricUpgradeElement))
+                    {
+                        _enableLyricUpgrade = enableLyricUpgradeElement.GetBoolean();
                     }
                 }
             }

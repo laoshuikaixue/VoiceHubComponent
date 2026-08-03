@@ -1,5 +1,6 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json.Serialization;
 
 namespace VoiceHubComponent.Models
@@ -44,6 +45,18 @@ namespace VoiceHubComponent.Models
 
         [JsonPropertyName("playUrl")]
         public string? PlayUrl { get; set; }
+
+        /// <summary>
+        /// 是否为重播歌曲
+        /// </summary>
+        [JsonPropertyName("isReplay")]
+        public bool IsReplay { get; set; }
+
+        /// <summary>
+        /// 歌曲封面 URL
+        /// </summary>
+        [JsonPropertyName("cover")]
+        public string? Cover { get; set; }
     }
 
     /// <summary>
@@ -121,12 +134,56 @@ namespace VoiceHubComponent.Models
         public bool Enabled { get; set; } = true;
     }
 
+    /// <summary>
+    /// 逐字歌词单词项
+    /// </summary>
+    public class LyricWordItem
+    {
+        public TimeSpan Start { get; set; }
+        public TimeSpan End { get; set; }
+        public string Text { get; set; } = string.Empty;
+
+        public LyricWordItem Clone()
+        {
+            return new LyricWordItem
+            {
+                Start = Start,
+                End = End,
+                Text = Text
+            };
+        }
+    }
+
+    /// <summary>
+    /// 歌词行，支持逐字时间轴、翻译、罗马音与 TTML 背景/合唱标记
+    /// </summary>
     public class LyricLineItem
     {
         public TimeSpan Start { get; set; }
         public TimeSpan End { get; set; }
         public string Text { get; set; } = string.Empty;
         public string? Translation { get; set; }
+        public string? Romanization { get; set; }
+
+        /// <summary>
+        /// TTML 背景声行
+        /// </summary>
+        public bool IsBG { get; set; }
+
+        /// <summary>
+        /// TTML 对唱行（第二个声部）
+        /// </summary>
+        public bool IsDuet { get; set; }
+
+        /// <summary>
+        /// 逐字时间轴；为空表示行级歌词
+        /// </summary>
+        public List<LyricWordItem> Words { get; set; } = new();
+
+        /// <summary>
+        /// 是否具备有效的逐字时间轴
+        /// </summary>
+        public bool HasWordTiming => Words.Any(word => word.End > word.Start);
 
         public LyricLineItem Clone()
         {
@@ -135,7 +192,11 @@ namespace VoiceHubComponent.Models
                 Start = Start,
                 End = End,
                 Text = Text,
-                Translation = Translation
+                Translation = Translation,
+                Romanization = Romanization,
+                IsBG = IsBG,
+                IsDuet = IsDuet,
+                Words = Words.Select(word => word.Clone()).ToList()
             };
         }
     }
