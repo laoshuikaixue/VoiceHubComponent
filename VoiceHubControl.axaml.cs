@@ -50,13 +50,11 @@ namespace VoiceHubComponent
         private DateTime _playbackDate = DateTime.MinValue;
         private string _scheduleSummaryText = string.Empty;
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
-        private const int LyricCacheVersion = 9;
+        private const int LyricCacheVersion = 10;
         private const int LyricFetchRetryCount = 3;
         private const int MinValidTencentAudioDurationSeconds = 10;
         private const string InvalidTencentAudioUrlSuffix = "/2149972737147268278.mp3";
         private static readonly TimeSpan MetadataLyricDurationTolerance = TimeSpan.FromSeconds(8);
-        private static readonly TimeSpan MaxLyricDurationOvershootTolerance = TimeSpan.FromSeconds(90);
-        private const double MaxLyricDurationOvershootRatio = 0.35;
         private static readonly TimeSpan LastResortSongDuration = TimeSpan.FromMinutes(4);
         private static readonly string CacheDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -67,10 +65,14 @@ namespace VoiceHubComponent
 
         // 封面显示相关
         private static readonly TimeSpan CoverTransitionDuration = TimeSpan.FromMilliseconds(180);
+        private const int CoverFetchRetryCount = 3;
+        private const long CoverMaxBytes = 10 * 1024 * 1024;
+        private static readonly TimeSpan CoverRequestTimeout = TimeSpan.FromSeconds(15);
         private readonly Dictionary<string, Bitmap?> _coverBitmapCache = new(StringComparer.OrdinalIgnoreCase);
         private Bitmap? _displayedCover;
         private string? _displayedCoverKey;
         private CancellationTokenSource? _coverTransitionCancellation;
+        private CancellationTokenSource _coverLoadCancellation = new();
 
         // 当前展示歌曲标识（避免重复刷新左侧面板）
         private string? _currentPlaybackKey;
@@ -218,6 +220,7 @@ namespace VoiceHubComponent
             _refreshTimer.Stop();
             _lyricTimer.Stop();
             _loadingGuardTimer.Stop();
+            _coverLoadCancellation.Cancel();
             StopCoverTransition(true);
             _httpClient.Dispose();
         }
@@ -704,8 +707,8 @@ namespace VoiceHubComponent
             var lyricDuration = LyricParser.GetEstimatedDuration(lyrics, TimeSpan.Zero);
             var durationProbe = await ResolveDurationAsync(song, lyricDuration, token);
 
-            // 歌词升级：仅在开启逐字歌词时发起，关闭时保持原有歌词，避免引入不确定性
-            if (Settings.WordByWord && Settings.EnableLyricUpgrade && lyrics.Count > 0)
+            // 歌词升级：仅在开启跨平台升级时发起，关闭时保持原有歌词，避免引入不确定性
+            if (Settings.EnableLyricUpgrade && lyrics.Count > 0)
             {
                 try
                 {
@@ -1669,6 +1672,10 @@ namespace VoiceHubComponent
                    duration < TimeSpan.FromSeconds(MinValidTencentAudioDurationSeconds);
         }
 
+        /// <summary>
+        /// 歌词时间轴只是时长的下界参考：尾奏、纯音乐段落或部分歌词都会让最后一句远早于曲终，
+        /// 因此只拒绝明显偏短的探测结果，绝不因偏长而否决，否则时长会退化成按最后一句歌词计时。
+        /// </summary>
         private static bool IsDurationTrusted(TimeSpan duration, TimeSpan lyricDuration)
         {
             if (duration <= TimeSpan.Zero)
@@ -1684,11 +1691,7 @@ namespace VoiceHubComponent
             var tolerance = TimeSpan.FromMilliseconds(Math.Max(
                 MetadataLyricDurationTolerance.TotalMilliseconds,
                 lyricDuration.TotalMilliseconds * 0.15));
-            var upperTolerance = TimeSpan.FromMilliseconds(Math.Max(
-                MaxLyricDurationOvershootTolerance.TotalMilliseconds,
-                lyricDuration.TotalMilliseconds * MaxLyricDurationOvershootRatio));
-            return duration + tolerance >= lyricDuration &&
-                   duration <= lyricDuration + upperTolerance;
+            return duration + tolerance >= lyricDuration;
         }
 
         private static string ComputeMd5Hex(string value)
@@ -2081,7 +2084,6 @@ namespace VoiceHubComponent
 
             LyricsPresenter.ShowTranslation = Settings.ShowTranslation;
             LyricsPresenter.ShowRomanization = Settings.ShowRomanization;
-            LyricsPresenter.WordByWord = Settings.WordByWord;
 
             if (string.Equals(entry.LyricStatus, "loading", StringComparison.OrdinalIgnoreCase))
             {
@@ -2113,21 +2115,35 @@ namespace VoiceHubComponent
                 return;
             }
 
+            // 新一首歌的封面接管加载权，放弃上一首尚未完成的下载与重试。
+            // 只 Cancel 不 Dispose：上一轮可能仍在 await 该令牌，提前释放会抛 ObjectDisposedException。
+            _coverLoadCancellation.Cancel();
+            var loadCancellation = _coverLoadCancellation = new CancellationTokenSource();
+            var token = loadCancellation.Token;
+
             Bitmap? bitmap = null;
             var coverKey = string.Empty;
             if (!string.IsNullOrWhiteSpace(coverUrl))
             {
                 var resolvedUrl = ResolveCoverUrl(coverUrl.Trim());
-                if (resolvedUrl != null)
+                if (resolvedUrl == null)
+                {
+                    _logger?.LogWarning("VoiceHub 封面地址无法解析：{CoverUrl}", coverUrl);
+                }
+                else
                 {
                     coverKey = ComputeMd5Hex(resolvedUrl.AbsoluteUri);
                     try
                     {
-                        bitmap = await LoadCoverBitmapAsync(resolvedUrl, coverKey);
+                        bitmap = await LoadCoverBitmapAsync(resolvedUrl, coverKey, token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
                     }
                     catch (Exception ex)
                     {
-                        _logger?.LogDebug(ex, "VoiceHub 封面加载失败：url={CoverUrl}", resolvedUrl);
+                        _logger?.LogWarning(ex, "VoiceHub 封面加载失败：url={CoverUrl}", resolvedUrl);
                     }
                 }
             }
@@ -2148,6 +2164,12 @@ namespace VoiceHubComponent
 
         private Uri? ResolveCoverUrl(string coverUrl)
         {
+            // 协议相对地址会被 Uri 解析成 file:///UNC 形态，补上 https 再解析。
+            if (coverUrl.StartsWith("//", StringComparison.Ordinal))
+            {
+                coverUrl = "https:" + coverUrl;
+            }
+
             if (Uri.TryCreate(coverUrl, UriKind.Absolute, out var absolute))
             {
                 return absolute.Scheme == Uri.UriSchemeHttp || absolute.Scheme == Uri.UriSchemeHttps ? absolute : null;
@@ -2162,7 +2184,7 @@ namespace VoiceHubComponent
             return null;
         }
 
-        private async Task<Bitmap?> LoadCoverBitmapAsync(Uri url, string coverKey)
+        private async Task<Bitmap?> LoadCoverBitmapAsync(Uri url, string coverKey, CancellationToken token)
         {
             lock (_coverBitmapCache)
             {
@@ -2175,24 +2197,44 @@ namespace VoiceHubComponent
             var coversDirectory = Path.Combine(CacheDirectory, "covers");
             var path = Path.Combine(coversDirectory, $"cover-{coverKey}.img");
             Bitmap? bitmap = null;
-            try
+            if (File.Exists(path))
             {
-                if (File.Exists(path))
+                try
                 {
-                    await using var fileStream = File.OpenRead(path);
-                    bitmap = Bitmap.DecodeToHeight(fileStream, 256);
+                    using var fileStream = File.OpenRead(path);
+                    bitmap = DecodeCover(fileStream);
                 }
-            }
-            catch
-            {
-                // 缓存文件损坏时重新下载。
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "VoiceHub 封面缓存不可用，重新下载：path={Path}", path);
+                    try
+                    {
+                        File.Delete(path);
+                    }
+                    catch
+                    {
+                        // 坏缓存删不掉时下次仍会走重新下载分支，不影响显示。
+                    }
+                }
             }
 
             if (bitmap == null)
             {
-                var bytes = await DownloadCoverBytesAsync(url);
-                if (bytes.Length == 0 || bytes.Length > 2 * 1024 * 1024)
+                var bytes = await DownloadCoverBytesAsync(url, token);
+                if (bytes.Length == 0)
                 {
+                    return null;
+                }
+
+                try
+                {
+                    using var memoryStream = new MemoryStream(bytes);
+                    bitmap = DecodeCover(memoryStream);
+                }
+                catch (Exception ex)
+                {
+                    // 解码失败不写盘也不进内存缓存，避免坏数据把占位符固化下来。
+                    _logger?.LogWarning(ex, "VoiceHub 封面解码失败：url={CoverUrl}, length={Length}", url, bytes.Length);
                     return null;
                 }
 
@@ -2205,9 +2247,6 @@ namespace VoiceHubComponent
                 {
                     // 封面缓存写入失败不影响显示。
                 }
-
-                await using var memoryStream = new MemoryStream(bytes);
-                bitmap = Bitmap.DecodeToHeight(memoryStream, 256);
             }
 
             lock (_coverBitmapCache)
@@ -2224,41 +2263,94 @@ namespace VoiceHubComponent
         }
 
         /// <summary>
-        /// 下载封面字节。首次使用 VoiceHub 同源请求头，失败后带浏览器 UA 与音乐站点 Referer 重试，规避 CDN 防盗链。
+        /// DecodeToHeight 对渐进式 JPEG 等非常规图片会失败，退回整图解码，避免直接显示占位符。
         /// </summary>
-        private async Task<byte[]> DownloadCoverBytesAsync(Uri url)
+        private static Bitmap DecodeCover(Stream stream)
         {
-            for (var attempt = 0; attempt < 2; attempt++)
+            try
+            {
+                return Bitmap.DecodeToHeight(stream, 256);
+            }
+            catch
+            {
+                stream.Position = 0;
+                return new Bitmap(stream);
+            }
+        }
+
+        /// <summary>
+        /// 下载封面字节。首次使用 VoiceHub 同源请求头，重试改用浏览器 UA 与图片站 Referer 规避防盗链；
+        /// 单次请求带独立超时，失败后按递增延迟重试，避免一次网络抖动就让整首歌只显示占位符。
+        /// </summary>
+        private async Task<byte[]> DownloadCoverBytesAsync(Uri url, CancellationToken token)
+        {
+            Exception? lastError = null;
+            for (var attempt = 1; attempt <= CoverFetchRetryCount; attempt++)
             {
                 try
                 {
-                    using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                    if (attempt == 0)
-                    {
-                        AddVoiceHubSameOriginHeaders(request, url);
-                    }
-                    else
-                    {
-                        request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-                        request.Headers.TryAddWithoutValidation("Referer", $"{url.Scheme}://{url.Host}/");
-                    }
-
-                    using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-                    response.EnsureSuccessStatusCode();
-                    if (response.Content.Headers.ContentLength is > 2 * 1024 * 1024)
-                    {
-                        return Array.Empty<byte>();
-                    }
-
-                    return await response.Content.ReadAsByteArrayAsync();
+                    return await DownloadCoverOnceAsync(url, attempt > 1, token);
                 }
-                catch (Exception ex) when (attempt == 0)
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
                 {
-                    _logger?.LogWarning(ex, "VoiceHub 封面下载失败，尝试携带浏览器请求头重试：url={CoverUrl}", url);
+                    throw;
                 }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                    _logger?.LogWarning(
+                        ex,
+                        "VoiceHub 封面下载失败：url={CoverUrl}, attempt={Attempt}/{Total}",
+                        url,
+                        attempt,
+                        CoverFetchRetryCount);
+                }
+
+                if (attempt == CoverFetchRetryCount)
+                {
+                    break;
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(attempt * 1.5), token);
             }
 
+            _logger?.LogWarning(lastError, "VoiceHub 封面下载重试后仍然失败：url={CoverUrl}", url);
             return Array.Empty<byte>();
+        }
+
+        private async Task<byte[]> DownloadCoverOnceAsync(Uri url, bool useBrowserHeaders, CancellationToken token)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (useBrowserHeaders)
+            {
+                request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+                request.Headers.TryAddWithoutValidation("Referer", $"{url.Scheme}://{url.Host}/");
+            }
+            else
+            {
+                AddVoiceHubSameOriginHeaders(request, url);
+            }
+
+            // 与外层取消令牌关联，单独限制单次请求耗时，防止 CDN 挂起把整轮重试拖过这首歌。
+            using var timeoutCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeoutCancellation.CancelAfter(CoverRequestTimeout);
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCancellation.Token);
+            response.EnsureSuccessStatusCode();
+
+            if ((response.Content.Headers.ContentLength ?? 0) > CoverMaxBytes)
+            {
+                _logger?.LogWarning("VoiceHub 封面体积过大，忽略：url={CoverUrl}", url);
+                return Array.Empty<byte>();
+            }
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(timeoutCancellation.Token);
+            if (bytes.Length > CoverMaxBytes)
+            {
+                _logger?.LogWarning("VoiceHub 封面体积过大，忽略：url={CoverUrl}, length={Length}", url, bytes.Length);
+                return Array.Empty<byte>();
+            }
+
+            return bytes;
         }
 
         private void SetCover(Bitmap? cover, string coverKey)

@@ -21,7 +21,6 @@ namespace VoiceHubComponent.Models
         private bool _showCover = true;
         private bool _showTranslation = true;
         private bool _showRomanization = false;
-        private bool _wordByWord = true;
         private bool _enableLyricUpgrade = true;
         private bool _isLoaded = false;
         private static readonly string SettingsPath = Path.Combine(
@@ -230,29 +229,7 @@ namespace VoiceHubComponent.Models
         }
 
         /// <summary>
-        /// 是否启用逐字歌词高亮。关闭后不发送歌词升级请求。
-        /// </summary>
-        public bool WordByWord
-        {
-            get
-            {
-                EnsureLoaded();
-                return _wordByWord;
-            }
-            set
-            {
-                EnsureLoaded();
-                if (_wordByWord != value)
-                {
-                    _wordByWord = value;
-                    OnPropertyChanged();
-                    SaveSettings();
-                }
-            }
-        }
-
-        /// <summary>
-        /// 是否启用跨平台歌词升级（TTML/逐字）。仅在逐字歌词开启时生效。
+        /// 是否启用跨平台歌词升级（TTML/逐字）。
         /// </summary>
         public bool EnableLyricUpgrade
         {
@@ -358,11 +335,6 @@ namespace VoiceHubComponent.Models
                     if (jsonDocument.RootElement.TryGetProperty("ShowRomanization", out var showRomanizationElement))
                     {
                         _showRomanization = showRomanizationElement.GetBoolean();
-                    }
-
-                    if (jsonDocument.RootElement.TryGetProperty("WordByWord", out var wordByWordElement))
-                    {
-                        _wordByWord = wordByWordElement.GetBoolean();
                     }
 
                     if (jsonDocument.RootElement.TryGetProperty("EnableLyricUpgrade", out var enableLyricUpgradeElement))

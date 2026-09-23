@@ -165,7 +165,6 @@ namespace VoiceHubComponent.Views
             Settings.ShowCover = true;
             Settings.ShowTranslation = true;
             Settings.ShowRomanization = false;
-            Settings.WordByWord = true;
             Settings.EnableLyricUpgrade = true;
             ApiUrlTextBox.Text = DefaultApiUrl;
             EnableLyricsCheckBox.IsChecked = false;
@@ -176,7 +175,6 @@ namespace VoiceHubComponent.Views
             ShowCoverCheckBox.IsChecked = true;
             ShowTranslationCheckBox.IsChecked = true;
             ShowRomanizationCheckBox.IsChecked = false;
-            WordByWordCheckBox.IsChecked = true;
             EnableLyricUpgradeCheckBox.IsChecked = true;
             this.ShowSuccessToast("已重置为默认配置");
         }
@@ -213,7 +211,6 @@ namespace VoiceHubComponent.Views
             Settings.ShowCover = ShowCoverCheckBox.IsChecked == true;
             Settings.ShowTranslation = ShowTranslationCheckBox.IsChecked == true;
             Settings.ShowRomanization = ShowRomanizationCheckBox.IsChecked == true;
-            Settings.WordByWord = WordByWordCheckBox.IsChecked == true;
             Settings.EnableLyricUpgrade = EnableLyricUpgradeCheckBox.IsChecked == true;
             return true;
         }

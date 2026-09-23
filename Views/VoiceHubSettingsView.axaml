@@ -42,17 +42,13 @@
             </fluent:SettingsExpander>
 
             <fluent:SettingsExpander Header="显示效果"
-                                     Description="左侧显示封面与歌曲信息，歌词支持逐字高亮、翻译与罗马音。"
+                                     Description="左侧显示封面与歌曲信息，歌词逐行显示，支持翻译与罗马音。"
                                      IconSource="{ci:FluentIconSource &#xE8D6;}">
                 <fluent:SettingsExpander.Footer>
                     <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
                         <CheckBox x:Name="ShowCoverCheckBox"
                                   IsChecked="{Binding ShowCover}"
                                   Content="显示封面"
-                                  VerticalAlignment="Center"/>
-                        <CheckBox x:Name="WordByWordCheckBox"
-                                  IsChecked="{Binding WordByWord}"
-                                  Content="逐字歌词"
                                   VerticalAlignment="Center"/>
                         <CheckBox x:Name="ShowTranslationCheckBox"
                                   IsChecked="{Binding ShowTranslation}"
@@ -67,7 +63,7 @@
             </fluent:SettingsExpander>
 
             <fluent:SettingsExpander Header="歌词升级"
-                                     Description="本侧歌词非最高阶格式时，跨平台搜索 TTML/逐字歌词。仅在开启逐字歌词时生效。"
+                                     Description="本侧歌词非最高阶格式时，跨平台搜索 TTML/逐字歌词。"
                                      IconSource="{ci:FluentIconSource &#xEBC9;}">
                 <fluent:SettingsExpander.Footer>
                     <CheckBox x:Name="EnableLyricUpgradeCheckBox"

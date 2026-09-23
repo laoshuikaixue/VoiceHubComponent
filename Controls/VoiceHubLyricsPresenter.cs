@@ -12,7 +12,7 @@ using VoiceHubComponent.Services;
 namespace VoiceHubComponent.Controls
 {
     /// <summary>
-    /// 歌词演示器：双层 StackPanel 上滑淡入切行，支持逐字/整行扫光、背景声行配对。
+    /// 歌词演示器：双层 StackPanel 上滑淡入逐行切换，支持背景声行配对。
     /// 由外部定时器按节奏调用 ShowStatus / ShowLines 驱动。
     /// </summary>
     public sealed class VoiceHubLyricsPresenter : UserControl
@@ -23,13 +23,11 @@ namespace VoiceHubComponent.Controls
         private StackPanel _front = CreateLayer();
         private StackPanel _back = CreateLayer();
         private readonly DispatcherTimer _transitionTimer = new();
-        private readonly List<WordLyricsText> _activeWordControls = new();
         private string _frameSignature = string.Empty;
         private TransitionState? _transition;
 
         public bool ShowTranslation { get; set; } = true;
         public bool ShowRomanization { get; set; }
-        public bool WordByWord { get; set; } = true;
         public double BaseFontSize { get; set; } = 15;
 
         public VoiceHubLyricsPresenter()
@@ -59,7 +57,6 @@ namespace VoiceHubComponent.Controls
             if (string.Equals(_frameSignature, signature, StringComparison.Ordinal)) return;
             _frameSignature = signature;
             CompleteTransition();
-            _activeWordControls.Clear();
             _back.Children.Clear();
             _back.Children.Add(new TextBlock
             {
@@ -86,28 +83,16 @@ namespace VoiceHubComponent.Controls
             }
 
             var signature = BuildSignature(activeLines);
-            if (!string.Equals(signature, _frameSignature, StringComparison.Ordinal))
-            {
-                _frameSignature = signature;
-                RebuildFrame(activeLines, positionMs);
-            }
-            else
-            {
-                UpdateActiveControls(activeLines, positionMs);
-            }
+            if (string.Equals(signature, _frameSignature, StringComparison.Ordinal)) return;
+            _frameSignature = signature;
+            RebuildFrame(activeLines);
         }
 
         /// <summary>
-        /// 计算下一次应刷新的延迟。
-        /// 扫光模式（含逐字与整行扫光）固定 33ms，行级静态模式按下一边界自适应。
+        /// 计算下一次应刷新的延迟：按最近的行起止时间边界自适应。
         /// </summary>
         public TimeSpan GetNextRefreshDelay(IReadOnlyList<LyricLineItem> lines, double positionMs)
         {
-            if (WordByWord && lines.Any(line => line.HasWordTiming))
-            {
-                return TimeSpan.FromMilliseconds(33);
-            }
-
             var nextBoundary = lines
                 .SelectMany(line => new[] { line.Start.TotalMilliseconds, line.End.TotalMilliseconds })
                 .Where(time => time > positionMs + 1)
@@ -117,20 +102,18 @@ namespace VoiceHubComponent.Controls
             return TimeSpan.FromMilliseconds(Math.Clamp(delay, 30, 1000));
         }
 
-        private void RebuildFrame(IReadOnlyList<LyricsLineSelection> activeLines, double position)
+        private void RebuildFrame(IReadOnlyList<LyricsLineSelection> activeLines)
         {
             CompleteTransition();
-            _activeWordControls.Clear();
             _back.Children.Clear();
             var hasDuet = activeLines.Any(item => item.IsDuetSide);
             foreach (var selection in activeLines)
             {
                 var line = selection.Line;
-                var control = new WordLyricsText
+                _back.Children.Add(new LyricsLineText
                 {
                     Line = line,
                     BackgroundLine = selection.BackgroundLine,
-                    PositionMs = position,
                     LineFontSize = line.IsBG ? Math.Max(9, BaseFontSize * 0.76) : BaseFontSize,
                     Foreground = Foreground ?? Brushes.White,
                     TextAlignment = selection.IsDuetSide
@@ -138,39 +121,15 @@ namespace VoiceHubComponent.Controls
                         : hasDuet
                             ? TextAlignment.Left
                             : TextAlignment.Center,
-                    WordByWord = WordByWord,
                     ShowTranslation = ShowTranslation,
                     ShowRomanization = ShowRomanization,
                     Opacity = line.IsBG ? 0.72 : 1,
                     HorizontalAlignment = HorizontalAlignment.Stretch,
                     MaxWidth = 760
-                };
-                _back.Children.Add(control);
-                _activeWordControls.Add(control);
+                });
             }
 
             StartTransition();
-        }
-
-        private void UpdateActiveControls(
-            IReadOnlyList<LyricsLineSelection> activeLines,
-            double position)
-        {
-            if (_activeWordControls.Count != activeLines.Count)
-            {
-                RebuildFrame(activeLines, position);
-                return;
-            }
-
-            for (var index = 0; index < activeLines.Count; index++)
-            {
-                var control = _activeWordControls[index];
-                var line = activeLines[index].Line;
-                control.Line = line;
-                control.BackgroundLine = activeLines[index].BackgroundLine;
-                control.PositionMs = position;
-                control.WordByWord = WordByWord;
-            }
         }
 
         private void StartTransition()
