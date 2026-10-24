@@ -19,6 +19,23 @@ namespace VoiceHubComponent.Cache
     }
 
     /// <summary>
+    /// 当日排期数据缓存文件结构；接口请求失败时用于继续展示，请求成功时按 Signature 比对是否有更新
+    /// </summary>
+    public sealed class ScheduleCache
+    {
+        public int Version { get; set; }
+        public string Date { get; set; } = string.Empty;
+
+        /// <summary>
+        /// 排期内容签名，用于判断是否需要更新缓存
+        /// </summary>
+        public string Signature { get; set; } = string.Empty;
+
+        public DateTime FetchedAt { get; set; }
+        public List<SongItem> Items { get; set; } = new();
+    }
+
+    /// <summary>
     /// 单首歌曲的缓存条目
     /// </summary>
     public sealed class CacheEntry

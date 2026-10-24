@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -37,7 +39,7 @@ namespace VoiceHubComponent
     public partial class VoiceHubControl : ComponentBase<VoiceHubSettings>
     {
         private static event Func<Task>? ManualRefreshRequested;
-        private readonly HttpClient _httpClient = new HttpClient();
+        private readonly HttpClient _httpClient = CreateHttpClient();
         private readonly SemaphoreSlim _refreshLock = new(1, 1);
         private readonly ILogger<VoiceHubControl>? _logger = IAppHost.TryGetService<ILogger<VoiceHubControl>>();
         private ComponentState _currentState = ComponentState.Loading;
@@ -51,7 +53,16 @@ namespace VoiceHubComponent
         private string _scheduleSummaryText = string.Empty;
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
         private const int LyricCacheVersion = 10;
+        private const int ScheduleCacheVersion = 1;
         private const int LyricFetchRetryCount = 3;
+        private const int ScheduleFetchRetryCount = 3;
+        private const string DefaultScheduleApiUrl = "https://voicehub.lao-shui.top/api/songs/public";
+
+        // 校园网出口的 NAT/中间盒会静默丢弃长连接，双栈中也可能只有一族可用：
+        // 一条连接或一个地址僵死就会拖垮请求。这里收紧连接超时与复用寿命，并在连接层做双栈竞速。
+        private static readonly TimeSpan RequestConnectTimeout = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(10);
+        private const int ConnectionAttemptStaggerMs = 250;
         private const int MinValidTencentAudioDurationSeconds = 10;
         private const string InvalidTencentAudioUrlSuffix = "/2149972737147268278.mp3";
         private static readonly TimeSpan MetadataLyricDurationTolerance = TimeSpan.FromSeconds(8);
@@ -107,7 +118,13 @@ namespace VoiceHubComponent
         private int _retryCount = 0;
         private const int MaxRetryCount = 3;
         private DateTime _lastFailureTime = DateTime.MinValue;
-        private readonly TimeSpan _retryDelay = TimeSpan.FromMinutes(10);
+
+        // 已有缓存兜底可展示，冷却期可以短一些，尽快回到实时数据并发现排期更新
+        private readonly TimeSpan _retryDelay = TimeSpan.FromMinutes(2);
+
+        // 排期数据来源：接口失败时回落到当日缓存，界面需要标记为缓存数据
+        private bool _scheduleFromCache;
+        private bool _liveScheduleFetchFailed;
 
         // 加载守护：超时自动重试
         private readonly DispatcherTimer _loadingGuardTimer;
@@ -124,9 +141,6 @@ namespace VoiceHubComponent
                 _logger);
             ManualRefreshRequested += HandleManualRefreshRequestedAsync;
             DetachedFromVisualTree += VoiceHubControl_DetachedFromVisualTree;
-
-            // 设置HTTP客户端超时
-            _httpClient.Timeout = TimeSpan.FromSeconds(10);
 
             // 初始化定时器，正常情况下1小时刷新一次，失败后1分钟检查一次
             _refreshTimer = new DispatcherTimer
@@ -166,6 +180,144 @@ namespace VoiceHubComponent
                         SetState(ComponentState.NetworkError, "广播站排期获取失败"));
                 }
             });
+        }
+
+        private static HttpClient CreateHttpClient()
+        {
+            // 限制连接寿命：校园网 NAT/中间盒静默丢弃长连接时，复用中的死连接会让请求一直挂到超时。
+            var handler = new SocketsHttpHandler
+            {
+                ConnectTimeout = RequestConnectTimeout,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(3),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1),
+                UseCookies = false,
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+                ConnectCallback = ConnectWithHappyEyeballsAsync
+            };
+            return new HttpClient(handler) { Timeout = RequestTimeout };
+        }
+
+        /// <summary>
+        /// 与浏览器 Happy Eyeballs 对齐：双栈地址交错、错峰并行建连，谁先通用谁。
+        /// 这是“浏览器能打开、HttpClient 超时”的常见差异来源——.NET 默认按 DNS 顺序串行尝试，
+        /// 遇到 IPv6 黑洞或被污染的地址时只能等超时，浏览器则早已用另一族连上。
+        /// </summary>
+        private static async ValueTask<Stream> ConnectWithHappyEyeballsAsync(
+            SocketsHttpConnectionContext context,
+            CancellationToken token)
+        {
+            var endPoint = context.DnsEndPoint;
+            var addresses = IPAddress.TryParse(endPoint.Host, out var literal)
+                ? new[] { literal }
+                : await Dns.GetHostAddressesAsync(endPoint.Host, token);
+
+            if (addresses.Length == 0)
+            {
+                throw new SocketException((int)SocketError.HostNotFound);
+            }
+
+            using var race = CancellationTokenSource.CreateLinkedTokenSource(token);
+            var attempts = InterleaveAddressFamilies(addresses)
+                .Select((address, index) =>
+                {
+                    var attempt = ConnectSocketAsync(address, endPoint.Port, index, race.Token);
+                    // 竞速结束后才失败的任务也要被观察，避免未观察任务异常。
+                    _ = attempt.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                    return attempt;
+                })
+                .ToList();
+
+            var failures = new List<Exception>();
+            try
+            {
+                while (attempts.Count > 0)
+                {
+                    var finished = await Task.WhenAny(attempts);
+                    attempts.Remove(finished);
+                    try
+                    {
+                        var socket = await finished;
+                        return new NetworkStream(socket, ownsSocket: true);
+                    }
+                    catch (Exception ex) when (!token.IsCancellationRequested)
+                    {
+                        failures.Add(ex);
+                    }
+                }
+
+                throw new AggregateException($"无法连接 {endPoint.Host}:{endPoint.Port}", failures);
+            }
+            finally
+            {
+                race.Cancel();
+                foreach (var pending in attempts)
+                {
+                    // 几乎同时成功的其他地址也要关掉；已完成的任务会同步执行这个 continuation。
+                    _ = pending.ContinueWith(
+                        t =>
+                        {
+                            if (t.Status == TaskStatus.RanToCompletion)
+                            {
+                                t.Result.Dispose();
+                            }
+                        },
+                        TaskContinuationOptions.ExecuteSynchronously);
+                }
+            }
+        }
+
+        private static List<IPAddress> InterleaveAddressFamilies(IEnumerable<IPAddress> addresses)
+        {
+            var ipv6 = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetworkV6).ToList();
+            var ipv4 = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToList();
+            var ordered = new List<IPAddress>(ipv4.Count + ipv6.Count);
+            for (var i = 0; i < Math.Max(ipv4.Count, ipv6.Count); i++)
+            {
+                if (i < ipv6.Count)
+                {
+                    ordered.Add(ipv6[i]);
+                }
+
+                if (i < ipv4.Count)
+                {
+                    ordered.Add(ipv4[i]);
+                }
+            }
+
+            return ordered;
+        }
+
+        private static async Task<Socket> ConnectSocketAsync(
+            IPAddress address,
+            int port,
+            int attemptIndex,
+            CancellationToken token)
+        {
+            if (attemptIndex > 0)
+            {
+                await Task.Delay(attemptIndex * ConnectionAttemptStaggerMs, token);
+            }
+
+            var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            try
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                timeout.CancelAfter(RequestConnectTimeout);
+                await socket.ConnectAsync(new IPEndPoint(address, port), timeout.Token);
+
+                // 另一条地址已抢先成功时主动放弃，避免留下无人使用的连接。
+                if (token.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(token);
+                }
+
+                return socket;
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
         }
 
         public static async Task RequestManualRefreshAsync()
@@ -249,11 +401,19 @@ namespace VoiceHubComponent
             if (_lastFailureTime != DateTime.MinValue &&
                 DateTime.Now - _lastFailureTime < _retryDelay)
             {
+                // 已经有内容（实时或缓存兜底）时保持展示，不要把界面切回错误态
+                if (_currentState == ComponentState.Loaded)
+                {
+                    return;
+                }
+
                 var remainingTime = _retryDelay - (DateTime.Now - _lastFailureTime);
                 await Dispatcher.UIThread.InvokeAsync(() =>
                     SetState(ComponentState.NetworkError, $"等待重试中... ({remainingTime.Minutes}分{remainingTime.Seconds}秒后重试)"));
                 return;
             }
+
+            var cooldownText = $"{(int)_retryDelay.TotalMinutes}分钟后重试";
 
             // 尝试加载数据，带重试逻辑
             for (int attempt = 0; attempt <= MaxRetryCount; attempt++)
@@ -262,9 +422,9 @@ namespace VoiceHubComponent
                 {
                     await LoadVoiceHubDataCoreAsync();
 
-                    // 成功加载，重置重试计数和失败时间
+                    // 成功加载，重置重试计数；接口本身仍失败（靠缓存展示）时保持冷却节奏以便尽快回到实时数据
                     _retryCount = 0;
-                    _lastFailureTime = DateTime.MinValue;
+                    _lastFailureTime = _liveScheduleFetchFailed ? DateTime.Now : DateTime.MinValue;
 
                     // 成功后恢复正常定时器间隔
                     await Dispatcher.UIThread.InvokeAsync(UpdateTimerInterval);
@@ -277,8 +437,12 @@ namespace VoiceHubComponent
                     // 如果还有重试机会
                     if (attempt < MaxRetryCount)
                     {
-                        await Dispatcher.UIThread.InvokeAsync(() =>
-                            SetState(ComponentState.NetworkError, $"获取失败，正在重试... ({_retryCount}/{MaxRetryCount})"));
+                        // 已有可展示内容时不闪烁错误态，避免实时数据被反复打断
+                        if (_currentState != ComponentState.Loaded)
+                        {
+                            await Dispatcher.UIThread.InvokeAsync(() =>
+                                SetState(ComponentState.NetworkError, $"获取失败，正在重试... ({_retryCount}/{MaxRetryCount})"));
+                        }
 
                         // 等待一段时间后重试（递增延迟：2秒、4秒、8秒）
                         var retryDelay = TimeSpan.FromSeconds(Math.Pow(2, attempt + 1));
@@ -291,15 +455,22 @@ namespace VoiceHubComponent
 
                         string errorMessage = ex switch
                         {
-                            HttpRequestException => "网络连接错误，10分钟后重试",
-                            TaskCanceledException => "请求超时，10分钟后重试",
-                            JsonException => "数据格式错误，10分钟后重试",
-                            _ => "获取失败，10分钟后重试"
+                            HttpRequestException => $"网络连接错误，{cooldownText}",
+                            TaskCanceledException => $"请求超时，{cooldownText}",
+                            JsonException => $"数据格式错误，{cooldownText}",
+                            _ => $"获取失败，{cooldownText}"
                         };
 
                         await Dispatcher.UIThread.InvokeAsync(() =>
                         {
-                            SetState(ComponentState.NetworkError, errorMessage);
+                            if (_currentState != ComponentState.Loaded)
+                            {
+                                SetState(ComponentState.NetworkError, errorMessage);
+                            }
+                            else
+                            {
+                                _logger?.LogWarning(ex, "VoiceHub 排期刷新失败，继续展示当前数据");
+                            }
                             UpdateTimerInterval();
                         });
                     }
@@ -309,75 +480,67 @@ namespace VoiceHubComponent
 
         private async Task LoadVoiceHubDataCoreAsync()
         {
-            // 设置加载状态
-            await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.Loading));
-
-            // 使用配置的API地址
-            var apiUrl = !string.IsNullOrEmpty(Settings.ApiUrl)
-                ? Settings.ApiUrl
-                : "https://voicehub.lao-shui.top/api/songs/public";
-
-            var jsonResponse = await _httpClient.GetStringAsync(apiUrl);
-            var songItems = JsonSerializer.Deserialize<List<SongItem>>(jsonResponse);
-
-            if (songItems == null || !songItems.Any())
+            // 已有内容可展示时不再切回加载态，避免每次刷新都闪烁；首次加载仍显示加载中
+            if (_currentState != ComponentState.Loaded)
             {
-                await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, "暂无排期数据"));
-                return;
+                await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.Loading));
             }
 
-            // 过滤掉无效日期的项目
-            var validItems = songItems.Where(s => s.GetPlayDate() != DateTime.MinValue).ToList();
+            var apiUrl = !string.IsNullOrEmpty(Settings.ApiUrl) ? Settings.ApiUrl : DefaultScheduleApiUrl;
+            var anchorDate = GetScheduleAnchorDate();
 
-            if (!validItems.Any())
+            List<SongItem>? liveItems = null;
+            Exception? liveError = null;
+            try
             {
-                await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, "暂无有效排期数据"));
-                return;
+                liveItems = await FetchScheduleItemsAsync(apiUrl);
+                _liveScheduleFetchFailed = false;
             }
-
-            // 找到今天或最近未来的排期
-            var today = GetScheduleAnchorDate();
-            var todaySchedule = validItems.Where(s => s.GetPlayDate() == today).OrderBy(s => s.Sequence).ToList();
+            catch (Exception ex)
+            {
+                liveItems = null;
+                liveError = ex;
+                _liveScheduleFetchFailed = true;
+                _logger?.LogWarning(ex, "VoiceHub 排期接口请求失败：url={ApiUrl}", apiUrl);
+            }
 
             List<SongItem> displayItems;
             DateTime actualDate;
+            bool fromCache;
 
-            if (todaySchedule.Any())
+            if (liveItems != null)
             {
-                displayItems = todaySchedule;
-                actualDate = today;
+                if (!TrySelectDisplaySchedule(liveItems, anchorDate, out displayItems, out actualDate, out var reason))
+                {
+                    await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, reason));
+                    return;
+                }
+
+                fromCache = false;
+                SaveScheduleCacheIfChanged(actualDate, displayItems);
+            }
+            else if (TryLoadCachedSchedule(anchorDate, out displayItems, out actualDate))
+            {
+                fromCache = true;
+                _logger?.LogWarning(
+                    "VoiceHub 排期接口不可用，改用本地缓存展示：date={Date}, songs={Count}",
+                    actualDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    displayItems.Count);
             }
             else
             {
-                // 找最近的未来排期
-                var futureSchedule = validItems
-                    .Where(s => s.GetPlayDate() > today)
-                    .GroupBy(s => s.GetPlayDate())
-                    .OrderBy(g => g.Key)
-                    .FirstOrDefault();
-
-                if (futureSchedule != null)
-                {
-                    displayItems = futureSchedule.OrderBy(s => s.Sequence).ToList();
-                    actualDate = futureSchedule.Key;
-                }
-                else
-                {
-                    await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, "暂无排期数据"));
-                    return;
-                }
+                // 既拿不到实时数据也没有可用缓存，交给外层重试与冷却逻辑
+                throw liveError!;
             }
 
-            // 验证显示项目的日期一致性
-            displayItems = displayItems.Where(item => item.GetPlayDate() == actualDate).ToList();
-
-            if (!displayItems.Any())
+            // 数据来源标记变化时强制重绘正在播放面板，让 [Cache] 标记及时生效
+            if (fromCache != _scheduleFromCache)
             {
-                await Dispatcher.UIThread.InvokeAsync(() => SetState(ComponentState.NoSchedule, "排期数据日期不一致"));
-                return;
+                _scheduleFromCache = fromCache;
+                _currentPlaybackKey = null;
             }
 
-            _scheduleSummaryText = BuildScheduleSummary(displayItems, actualDate);
+            _scheduleSummaryText = BuildScheduleSummary(displayItems, actualDate, fromCache);
             await BuildPlaybackPlanAsync(displayItems, actualDate);
 
             await Dispatcher.UIThread.InvokeAsync(() =>
@@ -385,6 +548,211 @@ namespace VoiceHubComponent
                 SetState(ComponentState.Loaded);
                 UpdateLyricDisplay();
             });
+        }
+
+        private async Task<List<SongItem>> FetchScheduleItemsAsync(string apiUrl)
+        {
+            // 不锁协议版本：让客户端与服务端正常协商（h2/h3 优先、必要时回退 1.1），
+            // 可靠性交给连接层处理，避免碰到只允许特定版本的站点。
+            using var request = new HttpRequestMessage(HttpMethod.Get, apiUrl);
+            using var response = await _httpClient.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+            var jsonResponse = await response.Content.ReadAsStringAsync();
+            var songItems = JsonSerializer.Deserialize<List<SongItem>>(jsonResponse);
+            return songItems ?? new List<SongItem>();
+        }
+
+        /// <summary>
+        /// 从排期列表中挑出要展示的那一天：优先当天，其次最近的未来排期
+        /// </summary>
+        private static bool TrySelectDisplaySchedule(
+            IReadOnlyList<SongItem> items,
+            DateTime today,
+            out List<SongItem> displayItems,
+            out DateTime actualDate,
+            out string reason)
+        {
+            displayItems = new List<SongItem>();
+            actualDate = DateTime.MinValue;
+            reason = "暂无排期数据";
+
+            var validItems = items.Where(s => s.GetPlayDate() != DateTime.MinValue).ToList();
+            if (validItems.Count == 0)
+            {
+                reason = "暂无有效排期数据";
+                return false;
+            }
+
+            var todaySchedule = validItems
+                .Where(s => s.GetPlayDate() == today)
+                .OrderBy(s => s.Sequence)
+                .ToList();
+
+            if (todaySchedule.Count > 0)
+            {
+                displayItems = todaySchedule;
+                actualDate = today;
+            }
+            else
+            {
+                var nearestFuture = validItems
+                    .Where(s => s.GetPlayDate() > today)
+                    .GroupBy(s => s.GetPlayDate())
+                    .OrderBy(g => g.Key)
+                    .FirstOrDefault();
+
+                if (nearestFuture == null)
+                {
+                    return false;
+                }
+
+                actualDate = nearestFuture.Key;
+                displayItems = nearestFuture.OrderBy(s => s.Sequence).ToList();
+            }
+
+            var selectedDate = actualDate;
+            displayItems = displayItems.Where(item => item.GetPlayDate() == selectedDate).ToList();
+            if (displayItems.Count == 0)
+            {
+                reason = "排期数据日期不一致";
+                return false;
+            }
+
+            reason = string.Empty;
+            return true;
+        }
+
+        private static string GetScheduleCachePath(DateTime date)
+        {
+            return Path.Combine(CacheDirectory, $"schedule-cache-{date:yyyy-MM-dd}.json");
+        }
+
+        private static bool TryGetCacheFileDate(string path, out DateTime date)
+        {
+            date = DateTime.MinValue;
+            var name = Path.GetFileNameWithoutExtension(path);
+            const string prefix = "schedule-cache-";
+            if (name.Length != prefix.Length + 10 || !name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return DateTime.TryParseExact(
+                name[prefix.Length..],
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out date);
+        }
+
+        private ScheduleCache? ReadScheduleCache(string path)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    return null;
+                }
+
+                return JsonSerializer.Deserialize<ScheduleCache>(File.ReadAllText(path), JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "VoiceHub 排期缓存读取失败：path={Path}", path);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 请求失败时的兜底：只使用当天或更晚排期的缓存，绝不回落到历史日期的排期
+        /// </summary>
+        private bool TryLoadCachedSchedule(DateTime anchorDate, out List<SongItem> displayItems, out DateTime actualDate)
+        {
+            displayItems = new List<SongItem>();
+            actualDate = anchorDate;
+
+            try
+            {
+                if (!Directory.Exists(CacheDirectory))
+                {
+                    return false;
+                }
+
+                var candidates = Directory.EnumerateFiles(CacheDirectory, "schedule-cache-*.json")
+                    .Select(path => (Path: path, Date: TryGetCacheFileDate(path, out var parsed) ? (DateTime?)parsed : null))
+                    .Where(pair => pair.Date.HasValue && pair.Date.Value >= anchorDate.Date)
+                    .OrderBy(pair => pair.Date)
+                    .ToList();
+
+                foreach (var candidate in candidates)
+                {
+                    var cache = ReadScheduleCache(candidate.Path);
+                    if (cache == null || cache.Version != ScheduleCacheVersion || cache.Items.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    if (TrySelectDisplaySchedule(cache.Items, anchorDate, out displayItems, out actualDate, out _))
+                    {
+                        return true;
+                    }
+
+                    displayItems = new List<SongItem>();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "VoiceHub 排期缓存兜底失败");
+            }
+
+            return false;
+        }
+
+        private static string BuildSchedulePayloadSignature(IReadOnlyList<SongItem> items)
+        {
+            return ComputeMd5Hex(JsonSerializer.Serialize(items));
+        }
+
+        /// <summary>
+        /// 实时数据与缓存比对，有变化才写盘；无变化时保留原文件避免频繁 IO
+        /// </summary>
+        private void SaveScheduleCacheIfChanged(DateTime date, IReadOnlyList<SongItem> items)
+        {
+            try
+            {
+                var signature = BuildSchedulePayloadSignature(items);
+                var path = GetScheduleCachePath(date);
+                var existing = ReadScheduleCache(path);
+                if (existing != null &&
+                    existing.Version == ScheduleCacheVersion &&
+                    string.Equals(existing.Signature, signature, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                _logger?.LogInformation(
+                    "VoiceHub 排期缓存{Action}：date={Date}, songs={Count}",
+                    existing != null ? "更新" : "写入",
+                    date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    items.Count);
+
+                var cache = new ScheduleCache
+                {
+                    Version = ScheduleCacheVersion,
+                    Date = date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    Signature = signature,
+                    FetchedAt = DateTime.Now,
+                    Items = items.ToList()
+                };
+
+                Directory.CreateDirectory(CacheDirectory);
+                File.WriteAllText(path, JsonSerializer.Serialize(cache, JsonOptions));
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "VoiceHub 排期缓存写入失败");
+                // 缓存写入失败只影响兜底能力，不阻断展示。
+            }
         }
 
         private DateTime GetScheduleAnchorDate()
@@ -397,9 +765,13 @@ namespace VoiceHubComponent
             return DateTime.Today;
         }
 
-        private string BuildScheduleSummary(IReadOnlyList<SongItem> displayItems, DateTime actualDate)
+        private static string BuildScheduleSummary(IReadOnlyList<SongItem> displayItems, DateTime actualDate, bool fromCache)
         {
             var sb = new StringBuilder();
+            if (fromCache)
+            {
+                sb.Append("[Cache]");
+            }
             sb.Append($"广播站排期 | {actualDate:yyyy/MM/dd}: ");
 
             var songInfos = displayItems.Select(item =>
@@ -550,6 +922,15 @@ namespace VoiceHubComponent
                 foreach (var file in Directory.EnumerateFiles(CacheDirectory, "lyrics-cache-*.json"))
                 {
                     if (!string.Equals(Path.GetFileName(file), currentFileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        File.Delete(file);
+                    }
+                }
+
+                // 排期缓存按展示日期分文件；只删已经过去的日子。以真实今天为下限，避免调试日期误删当天缓存。
+                foreach (var file in Directory.EnumerateFiles(CacheDirectory, "schedule-cache-*.json"))
+                {
+                    if (TryGetCacheFileDate(file, out var fileDate) && fileDate < DateTime.Today)
                     {
                         File.Delete(file);
                     }
@@ -2056,7 +2437,7 @@ namespace VoiceHubComponent
 
             _currentPlaybackKey = key;
             var song = entry.Item.Song;
-            NowPlayingTitle.Text = $"#{entry.Item.Sequence} {song.Title}";
+            NowPlayingTitle.Text = $"{(_scheduleFromCache ? "[Cache] " : string.Empty)}#{entry.Item.Sequence} {song.Title}";
             var artistParts = new List<string>();
             if (song.IsReplay)
             {
