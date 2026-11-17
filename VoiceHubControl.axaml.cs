@@ -52,7 +52,7 @@ namespace VoiceHubComponent
         private DateTime _playbackDate = DateTime.MinValue;
         private string _scheduleSummaryText = string.Empty;
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
-        private const int LyricCacheVersion = 10;
+        private const int LyricCacheVersion = 11;
         private const int ScheduleCacheVersion = 1;
         private const int LyricFetchRetryCount = 3;
         private const int ScheduleFetchRetryCount = 3;
@@ -117,12 +117,8 @@ namespace VoiceHubComponent
         // 重试逻辑相关字段
         private int _retryCount = 0;
         private const int MaxRetryCount = 3;
-        private DateTime _lastFailureTime = DateTime.MinValue;
 
-        // 已有缓存兜底可展示，冷却期可以短一些，尽快回到实时数据并发现排期更新
-        private readonly TimeSpan _retryDelay = TimeSpan.FromMinutes(2);
-
-        // 排期数据来源：接口失败时回落到当日缓存，界面需要标记为缓存数据
+        // 排期数据来源：接口失败时回落到当日缓存，排期摘要需要标记为缓存数据
         private bool _scheduleFromCache;
         private bool _liveScheduleFetchFailed;
 
@@ -142,10 +138,10 @@ namespace VoiceHubComponent
             ManualRefreshRequested += HandleManualRefreshRequestedAsync;
             DetachedFromVisualTree += VoiceHubControl_DetachedFromVisualTree;
 
-            // 初始化定时器，正常情况下1小时刷新一次，失败后1分钟检查一次
+            // 初始化定时器：实时数据每3小时刷新一次，失败时按重试节奏收紧
             _refreshTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromHours(1) // 默认1小时刷新一次
+                Interval = TimeSpan.FromHours(3)
             };
             _refreshTimer.Tick += async (sender, e) => await RefreshAsync();
             _refreshTimer.Start();
@@ -379,41 +375,23 @@ namespace VoiceHubComponent
 
         private void UpdateTimerInterval()
         {
-            // 如果有失败记录且还在冷却期内，设置为1分钟检查一次
-            if (_lastFailureTime != DateTime.MinValue &&
-                DateTime.Now - _lastFailureTime < _retryDelay)
+            if (_liveScheduleFetchFailed)
             {
-                _refreshTimer.Interval = TimeSpan.FromMinutes(1);
+                // 请求失败：没有可展示内容时每分钟连续重试；已靠缓存展示时不必这么密，10 分钟再试一次
+                _refreshTimer.Interval = _currentState == ComponentState.Loaded
+                    ? TimeSpan.FromMinutes(10)
+                    : TimeSpan.FromMinutes(1);
+                return;
             }
-            else
-            {
-                // 恢复正常的1小时间隔
-                _refreshTimer.Interval = TimeSpan.FromHours(1);
-            }
+
+            // 实时数据正常，无需频繁拉取
+            _refreshTimer.Interval = TimeSpan.FromHours(3);
         }
 
         private async Task LoadVoiceHubDataAsync()
         {
             // 更新定时器间隔
-            UpdateTimerInterval();
-
-            // 检查是否需要等待（上次失败后的冷却时间）
-            if (_lastFailureTime != DateTime.MinValue &&
-                DateTime.Now - _lastFailureTime < _retryDelay)
-            {
-                // 已经有内容（实时或缓存兜底）时保持展示，不要把界面切回错误态
-                if (_currentState == ComponentState.Loaded)
-                {
-                    return;
-                }
-
-                var remainingTime = _retryDelay - (DateTime.Now - _lastFailureTime);
-                await Dispatcher.UIThread.InvokeAsync(() =>
-                    SetState(ComponentState.NetworkError, $"等待重试中... ({remainingTime.Minutes}分{remainingTime.Seconds}秒后重试)"));
-                return;
-            }
-
-            var cooldownText = $"{(int)_retryDelay.TotalMinutes}分钟后重试";
+            await Dispatcher.UIThread.InvokeAsync(UpdateTimerInterval);
 
             // 尝试加载数据，带重试逻辑
             for (int attempt = 0; attempt <= MaxRetryCount; attempt++)
@@ -422,11 +400,10 @@ namespace VoiceHubComponent
                 {
                     await LoadVoiceHubDataCoreAsync();
 
-                    // 成功加载，重置重试计数；接口本身仍失败（靠缓存展示）时保持冷却节奏以便尽快回到实时数据
+                    // 成功加载，重置重试计数
                     _retryCount = 0;
-                    _lastFailureTime = _liveScheduleFetchFailed ? DateTime.Now : DateTime.MinValue;
 
-                    // 成功后恢复正常定时器间隔
+                    // 按本次结果（实时或缓存兜底）决定下一次刷新间隔
                     await Dispatcher.UIThread.InvokeAsync(UpdateTimerInterval);
                     return;
                 }
@@ -450,15 +427,12 @@ namespace VoiceHubComponent
                     }
                     else
                     {
-                        // 所有重试都失败了，记录失败时间并设置错误状态
-                        _lastFailureTime = DateTime.Now;
-
                         string errorMessage = ex switch
                         {
-                            HttpRequestException => $"网络连接错误，{cooldownText}",
-                            TaskCanceledException => $"请求超时，{cooldownText}",
-                            JsonException => $"数据格式错误，{cooldownText}",
-                            _ => $"获取失败，{cooldownText}"
+                            HttpRequestException => "网络连接错误，将持续重试",
+                            TaskCanceledException => "请求超时，将持续重试",
+                            JsonException => "数据格式错误，将持续重试",
+                            _ => "获取失败，将持续重试"
                         };
 
                         await Dispatcher.UIThread.InvokeAsync(() =>
@@ -533,13 +507,7 @@ namespace VoiceHubComponent
                 throw liveError!;
             }
 
-            // 数据来源标记变化时强制重绘正在播放面板，让 [Cache] 标记及时生效
-            if (fromCache != _scheduleFromCache)
-            {
-                _scheduleFromCache = fromCache;
-                _currentPlaybackKey = null;
-            }
-
+            _scheduleFromCache = fromCache;
             _scheduleSummaryText = BuildScheduleSummary(displayItems, actualDate, fromCache);
             await BuildPlaybackPlanAsync(displayItems, actualDate);
 
@@ -2138,6 +2106,11 @@ namespace VoiceHubComponent
 
         private static double TryReadMp3Bitrate(byte[] bytes)
         {
+            if (IsNonMp3Container(bytes))
+            {
+                return 0;
+            }
+
             var startOffset = SkipId3v2Tag(bytes);
             for (var i = startOffset; i < bytes.Length - 4; i++)
             {
@@ -2161,6 +2134,17 @@ namespace VoiceHubComponent
             }
 
             return 0;
+        }
+
+        // FLAC/Ogg/WAV/M4A 的音频数据里同样散布着 0xFFEx 同步字节，按 MP3 帧头扫描会凑出虚假比特率，
+        // 把时长估算放大数倍。非 MP3 容器直接放弃探测，交回官方元数据。
+        private static bool IsNonMp3Container(byte[] bytes)
+        {
+            var head = Encoding.ASCII.GetString(bytes, 0, Math.Min(bytes.Length, 12));
+            return head.StartsWith("fLaC", StringComparison.Ordinal) ||
+                   head.StartsWith("OggS", StringComparison.Ordinal) ||
+                   head.StartsWith("RIFF", StringComparison.Ordinal) ||
+                   (head.Length >= 8 && string.Equals(head.Substring(4, 4), "ftyp", StringComparison.Ordinal));
         }
 
         private static bool TryReadMp3FrameHeader(
@@ -2437,7 +2421,7 @@ namespace VoiceHubComponent
 
             _currentPlaybackKey = key;
             var song = entry.Item.Song;
-            NowPlayingTitle.Text = $"{(_scheduleFromCache ? "[Cache] " : string.Empty)}#{entry.Item.Sequence} {song.Title}";
+            NowPlayingTitle.Text = $"#{entry.Item.Sequence} {song.Title}";
             var artistParts = new List<string>();
             if (song.IsReplay)
             {
